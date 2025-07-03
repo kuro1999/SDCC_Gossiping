@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  node1:
+    image: gossip-node
+    build:
+      context: .
+    container_name: node1
+    command: ["A", "0.0.0.0:8001", "node2:8002,node3:8003"]
+    ports:
+      - "8001:8001"
+    networks:
+      - gossip-net
+
+  node2:
+    image: gossip-node
+    build:
+      context: .
+    container_name: node2
+    command: ["B", "0.0.0.0:8002", "node1:8001,node3:8003"]
+    ports:
+      - "8002:8002"
+    networks:
+      - gossip-net
+
+  node3:
+    image: gossip-node
+    build:
+      context: .
+    container_name: node3
+    command: ["C", "0.0.0.0:8003", "node1:8001,node2:8002"]
+    ports:
+      - "8003:8003"
+    networks:
+      - gossip-net
+
+networks:
+  gossip-net:
+    driver: bridge

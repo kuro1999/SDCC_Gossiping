@@ -22,15 +22,16 @@ type MemberInfo struct {
 
 // Node rappresenta un membro del cluster gossip.
 type Node struct {
-	ID       string
-	Addr     *net.UDPAddr
-	peers    []*net.UDPAddr
-	members  map[string]*MemberInfo
-	mu       sync.RWMutex
-	conn     *net.UDPConn
-	tick     time.Duration
-	detector *detector.FailureDetector
-	inbox    chan []byte
+	ID           string
+	Addr         *net.UDPAddr
+	peers        []*net.UDPAddr
+	members      map[string]*MemberInfo
+	mu           sync.RWMutex
+	conn         *net.UDPConn
+	tick         time.Duration
+	detector     *detector.FailureDetector
+	phiThreshold float64
+	inbox        chan []byte
 }
 
 // Config crea un Node configurato, senza connessione aperta.
@@ -53,17 +54,18 @@ func Config(id, bindAddr string, tick time.Duration, peerAddrs []string) (*Node,
 	members := make(map[string]*MemberInfo)
 	members[id] = &MemberInfo{ID: id, Addr: bindAddr, Heartbeat: 0, Alive: true}
 
-	// Inizializza il FailureDetector (windowSize=5, thresholdPhi=8.0)
+	// Inizializza il FailureDetector (windowSize=5, soglia phi=8.0)
 	fd := detector.New(5, 8.0)
 
 	return &Node{
-		ID:       id,
-		Addr:     udpAddr,
-		peers:    peers,
-		members:  members,
-		tick:     tick,
-		detector: fd,
-		inbox:    make(chan []byte, 100),
+		ID:           id,
+		Addr:         udpAddr,
+		peers:        peers,
+		members:      members,
+		tick:         tick,
+		detector:     fd,
+		phiThreshold: 8.0,
+		inbox:        make(chan []byte, 100),
 	}, nil
 }
 
@@ -81,7 +83,7 @@ func (n *Node) Start() error {
 	return nil
 }
 
-// listen riceve pacchetti, aggiorna la view e li invia sull'inbox.
+// listen riceve pacchetti, aggiorna la view, notifica il detector e li invia sull'inbox.
 func (n *Node) listen() {
 	buf := make([]byte, 4096)
 	for {
@@ -90,7 +92,8 @@ func (n *Node) listen() {
 			fmt.Println("listen error:", err)
 			continue
 		}
-		// copia del dato grezzo per invitare sul canale
+
+		// copia del dato grezzo per l'inbox
 		data := make([]byte, nr)
 		copy(data, buf[:nr])
 		n.inbox <- data
@@ -126,21 +129,23 @@ func (n *Node) listen() {
 	}
 }
 
-// gossipLoop invia periodicamente il proprio stato a un peer casuale.
+// gossipLoop invia periodicamente il proprio heartbeat e controlla il failure detector.
 func (n *Node) gossipLoop() {
 	ticker := time.NewTicker(n.tick)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		n.mu.Lock()
 		now := time.Now()
-		// incremento del mio heartbeat e notifico il detector
+
+		// 1) Aggiorna il proprio heartbeat
+		n.mu.Lock()
 		my := n.members[n.ID]
 		my.Heartbeat++
 		my.LastSeen = now
+		// notifica il detector del proprio heartbeat
 		n.detector.HeartbeatNotify(n.ID, now)
 
-		// preparo il payload gossip
+		// 2) Prepara e invia il payload gossip
 		payload := make(map[string]MemberInfo, len(n.members))
 		for id, mi := range n.members {
 			payload[id] = *mi
@@ -151,8 +156,6 @@ func (n *Node) gossipLoop() {
 			n.mu.Unlock()
 			continue
 		}
-
-		// seleziono un peer random e invio
 		if len(n.peers) > 0 {
 			idx := rand.Intn(len(n.peers))
 			peer := n.peers[idx]
@@ -163,6 +166,20 @@ func (n *Node) gossipLoop() {
 			}
 		}
 		n.mu.Unlock()
+
+		// 3) Failure detection: calcola phi per ogni peer e marca Alive=false se supera la soglia
+		n.mu.RLock()
+		for id, mi := range n.members {
+			if id == n.ID {
+				continue // salta se stesso
+			}
+			phi := n.detector.Suspicion(id, now)
+			if float64(phi) > n.phiThreshold && mi.Alive {
+				mi.Alive = false
+				fmt.Printf("[%s] detected failure of %s (phi=%.2f)\n", n.ID, id, phi)
+			}
+		}
+		n.mu.RUnlock()
 	}
 }
 
