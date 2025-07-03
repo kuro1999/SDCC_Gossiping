@@ -1,1 +1,2 @@
 # SDCC_Gossiping
+funzia?
