@@ -46,7 +46,10 @@ func (r *Registry) Register(s ServiceInfo) {
 	r.mu.Unlock()
 	// propaga l'evento via gossip
 	data, _ := json.Marshal(event{Type: evtAdd, Svc: s})
-	r.g.SendToRandomPeer(data)
+	err := r.g.SendToRandomPeer(data)
+	if err != nil {
+		return
+	}
 }
 
 func (r *Registry) Unregister(id string) {
@@ -58,7 +61,10 @@ func (r *Registry) Unregister(id string) {
 	r.mu.Unlock()
 	if ok {
 		data, _ := json.Marshal(event{Type: evtRemove, Svc: s})
-		r.g.SendToRandomPeer(data)
+		err := r.g.SendToRandomPeer(data)
+		if err != nil {
+			return
+		}
 	}
 }
 
