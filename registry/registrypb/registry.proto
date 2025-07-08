@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package registrypb;
+
+// qui dichiari il path Go completo del pacchetto che stiamo per generare:
+option go_package = "SDCC_gossiping/registry/registrypb;registrypb";
+
+// … il resto del proto …
+service Registry {
+  rpc Register   (ServiceRequest)    returns (Empty)       {}
+  rpc Unregister (UnregisterRequest) returns (Empty)       {}
+  rpc Lookup     (LookupRequest)     returns (LookupReply) {}
+}
+
+message ServiceRequest {
+  string id      = 1;
+  string address = 2;
+  repeated string tags = 3;
+}
+
+message UnregisterRequest {
+  string id = 1;
+}
+
+message LookupRequest {
+  string tag = 1;
+}
+
+message ServiceInfo {
+  string id      = 1;
+  string address = 2;
+  repeated string tags = 3;
+}
+
+message LookupReply {
+  repeated ServiceInfo services = 1;
+}
+
+message Empty {}
