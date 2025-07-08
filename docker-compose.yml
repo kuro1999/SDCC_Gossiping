@@ -1,39 +1,47 @@
-version: '3.8'
-
 services:
-  node1:
-    image: gossip-node
+  registry:
     build:
-      context: .
-    container_name: node1
-    command: ["A", "0.0.0.0:8001", "node2:8002,node3:8003"]
+      context: ./registry
+      dockerfile: Dockerfile.registry
+    image: gossip-registry
+    environment:
+      - REGISTRY_PORT=${REGISTRY_PORT}
     ports:
-      - "8001:8001"
-    networks:
-      - gossip-net
+      - "${REGISTRY_PORT}:${REGISTRY_PORT}"
+
+  node1:
+    build:
+      context: ./node
+      dockerfile: Dockerfile.node
+    image: gossip-node
+    command: ["./node", "${NODE_1_ID}", "node1:8000", "registry:${REGISTRY_PORT}"]
+    ports:
+      - "8000:8000"
+    depends_on:
+      - registry
+    restart: unless-stopped
 
   node2:
-    image: gossip-node
     build:
-      context: .
-    container_name: node2
-    command: ["B", "0.0.0.0:8002", "node1:8001,node3:8003"]
+      context: ./node
+      dockerfile: Dockerfile.node
+    image: gossip-node
+    command: ["./node", "${NODE_2_ID}", "node2:8000", "registry:${REGISTRY_PORT}"]
     ports:
-      - "8002:8002"
-    networks:
-      - gossip-net
+      - "8001:8000"
+    depends_on:
+      - registry
+    restart: unless-stopped
+
 
   node3:
-    image: gossip-node
     build:
-      context: .
-    container_name: node3
-    command: ["C", "0.0.0.0:8003", "node1:8001,node2:8002"]
+      context: ./node
+      dockerfile: Dockerfile.node
+    image: gossip-node
+    command: ["./node", "${NODE_3_ID}", "node3:8000", "registry:${REGISTRY_PORT}"]
     ports:
-      - "8003:8003"
-    networks:
-      - gossip-net
-
-networks:
-  gossip-net:
-    driver: bridge
+      - "8002:8000"
+    depends_on:
+      - registry
+    restart: unless-stopped
