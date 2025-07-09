@@ -1,4 +1,4 @@
-// registry.go
+// registry.go – compatibile con SWIM
 
 package main
 
@@ -12,6 +12,8 @@ import (
 	"sync"
 )
 
+func init() { log.SetFlags(0) }
+
 type Peer struct {
 	ID   string
 	Addr string
@@ -22,59 +24,112 @@ var (
 	peersMu sync.Mutex
 )
 
+// ------------------------------------------------------------------
+// utilità
+// ------------------------------------------------------------------
+
+func peerExists(addr string) bool {
+	for _, p := range peers {
+		if p.Addr == addr {
+			return true
+		}
+	}
+	return false
+}
+
+func addPeer(id, addr string) {
+	if peerExists(addr) {
+		return
+	}
+	peers = append(peers, Peer{ID: id, Addr: addr})
+}
+
+func removePeer(addr string) {
+	newPeers := peers[:0]
+	for _, p := range peers {
+		if p.Addr != addr {
+			newPeers = append(newPeers, p)
+		}
+	}
+	peers = newPeers
+}
+
+// ------------------------------------------------------------------
+// connessione singola
+// ------------------------------------------------------------------
+
 func handleConn(conn net.Conn) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
 
-	// 1) Leggi ID e indirizzo (es. "node123 10.0.0.5:8000\n")
 	line, err := reader.ReadString('\n')
 	if err != nil {
-		log.Printf("[REGISTRY] Errore lettura ID e address dal nodo: %v", err)
+		log.Printf("[REGISTRY] read error: %v", err)
 		return
 	}
-	parts := strings.Fields(strings.TrimSpace(line))
-	if len(parts) != 2 {
-		log.Printf("[REGISTRY] Formato non valido: %q", line)
+	line = strings.TrimSpace(line)
+	fields := strings.Fields(line)
+	if len(fields) != 2 {
+		log.Printf("[REGISTRY] malformed line: %q", line)
 		return
 	}
-	nodeID, nodeAddr := parts[0], parts[1]
+	cmd, arg := fields[0], fields[1]
 
-	// 2) Invia la lista dei peer esistenti (solo gli indirizzi)
-	peersMu.Lock()
-	for _, p := range peers {
-		log.Printf("[REGISTRY] Inviando peer.Addr = %q", p.Addr)
-		fmt.Fprintln(conn, p.Addr) // <— solo “node1:8000”
-	}
-	peersMu.Unlock()
+	switch cmd {
+	case "FAIL":
+		peersMu.Lock()
+		removePeer(arg)
+		peersMu.Unlock()
+		log.Printf("[REGISTRY] Peer %s removed (FAIL)", arg)
+		return
 
-	// 3) Aggiungi il nodo se non già presente (controllo su ID)
-	peersMu.Lock()
-	exists := false
-	for _, p := range peers {
-		if p.ID == nodeID {
-			exists = true
-			break
+	case "LEAVE":
+		peersMu.Lock()
+		removePeer(arg)
+		peersMu.Unlock()
+		log.Printf("[REGISTRY] Peer %s removed (LEAVE)", arg)
+		return
+
+	case "ALIVE":
+		peersMu.Lock()
+		addPeer(arg, arg) // ID = addr se non noto
+		peersMu.Unlock()
+		log.Printf("[REGISTRY] Peer %s resurrected (ALIVE)", arg)
+		return
+
+		// dentro handleConn, versione minimale:
+	default:
+		nodeID, nodeAddr := cmd, arg
+		peersMu.Lock()
+		for _, p := range peers {
+			fmt.Fprintln(conn, p.Addr)
 		}
+		addPeer(nodeID, nodeAddr)
+		log.Printf("[REGISTRY] Registered Node: %s (%s)", nodeID, nodeAddr)
+		peersMu.Unlock()
 	}
-	if !exists {
-		peers = append(peers, Peer{ID: nodeID, Addr: nodeAddr})
-		log.Printf("[REGISTRY] Nodo registrato: %s (%s)", nodeID, nodeAddr)
-	} else {
-		log.Printf("[REGISTRY] Nodo già presente: %s", nodeID)
-	}
-	peersMu.Unlock()
 }
+
+// ------------------------------------------------------------------
+// main
+// ------------------------------------------------------------------
 
 func main() {
 	port := os.Getenv("REGISTRY_PORT")
 	if port == "" {
 		port = "8080"
 	}
-	ln, _ := net.Listen("tcp", ":"+port)
+
+	ln, err := net.Listen("tcp", ":"+port)
+	if err != nil {
+		log.Fatalf("[REGISTRY] listen failed: %v", err)
+	}
+	log.Printf("[REGISTRY] Listening on :%s", port)
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("Accept fallito: %v", err)
+			log.Printf("[REGISTRY] accept error: %v", err)
 			continue
 		}
 		go handleConn(conn)

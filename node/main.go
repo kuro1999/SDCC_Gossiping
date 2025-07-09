@@ -7,158 +7,75 @@ import (
 	"net"
 	"os"
 	"strings"
-	"sync"
 	"time"
 )
 
-var (
-	peers        []string // lista dinamica di peer
-	peersMu      sync.Mutex
-	pendingJoins []string // indirizzi JOIN da piggybackare
-	joinsMu      sync.Mutex
-	lastSeen     = make(map[string]time.Time)
-	lastSeenMu   sync.Mutex
-)
+// ---------- [SWIM-INTEGRATION] ----------
+/*
+   swim.go (stesso package main) espone:
 
-// init configura il logger con timestamp e prefix
-func init() {
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-}
+   // inizializza tabelle interne e parte la probe-loop
+   func StartSWIM(myAddr string)
 
-// getPeers invia "myID myAddr" al registry e riceve la lista iniziale di indirizzi
+   // inserisce peer già noti come ALIVE (incarnation 0)
+   func AddInitialPeers(peers []string)
+
+   // parser/dispatcher per tutti i frame SWIM
+   func HandleSWIM(msg string)
+*/
+//----------------------------------------
+
+var registryAddr string // per le chiamate dirette / JOIN bootstrap
+
+// init: timestamp + prefix nel logger
+func init() { log.SetFlags(0) }
+
+// getPeers → invariato: contatta il registry e restituisce gli indirizzi noti
 func getPeers(registryAddr, myID, myAddr string) []string {
 	for {
 		conn, err := net.Dial("tcp", registryAddr)
 		if err != nil {
-			log.Printf("[BOOT] Registry non raggiungibile (%v), riprovo in 5s...", err)
+			log.Printf("[BOOT] Registry not reached (%v), retry in 5s...", err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
 		defer conn.Close()
 
-		// invio ID + indirizzo
 		fmt.Fprintf(conn, "%s %s\n", myID, myAddr)
 
-		// leggo la lista dei peer (solo indirizzi)
 		var list []string
 		scanner := bufio.NewScanner(conn)
 		for scanner.Scan() {
 			list = append(list, scanner.Text())
 		}
-		log.Printf("[BOOT] Peer iniziali ricevuti: %v", list)
+		log.Printf("[BOOT] Initial Peers: %v", list)
 		return list
 	}
 }
 
-// announceJoins invia immediatamente le JOIN pendenti a tutti i peer conosciuti
-func announceJoins(myAddr string) {
-	peersMu.Lock()
-	targets := append([]string{}, peers...)
-	peersMu.Unlock()
+// -------------------------------- LISTENER ----------------------------------
 
-	joinsMu.Lock()
-	toAnnounce := append([]string{}, pendingJoins...)
-	joinsMu.Unlock()
-
-	for _, addr := range targets {
-		if addr == myAddr {
-			continue
-		}
-		go func(a string) {
-			conn, err := net.Dial("tcp", a)
-			if err != nil {
-				return
-			}
-			defer conn.Close()
-			for _, j := range toAnnounce {
-				fmt.Fprintf(conn, "JOIN %s\n", j)
-				log.Printf("[GOSSIP] Inviato JOIN %s a %s", j, a)
-			}
-		}(addr)
-	}
-}
-
-// gossipLoop invia JOIN (se targets non vuoti) e PING ai peer ogni 5s
-func gossipLoop(myAddr string) {
-	ticker := time.NewTicker(5 * time.Second)
-	for range ticker.C {
-		// snapshot lista peers
-		peersMu.Lock()
-		targets := append([]string{}, peers...)
-		peersMu.Unlock()
-
-		// snapshot JOIN pendenti
-		joinsMu.Lock()
-		toAnnounce := append([]string{}, pendingJoins...)
-		// reset pendings solo se c'è un target
-		if len(targets) > 0 {
-			pendingJoins = nil
-		}
-		joinsMu.Unlock()
-
-		log.Printf("[GOSSIP] Targets: %v", targets)
-		for _, addr := range targets {
-			if addr == myAddr {
-				continue
-			}
-			go func(a string) {
-				conn, err := net.Dial("tcp", a)
-				if err != nil {
-					log.Printf("[GOSSIP] Fallito gossip verso %s: %v", a, err)
-					return
-				}
-				defer conn.Close()
-
-				// invio JOIN pendenti
-				for _, j := range toAnnounce {
-					fmt.Fprintf(conn, "JOIN %s\n", j)
-					log.Printf("[GOSSIP] Inviato JOIN %s a %s", j, a)
-				}
-				// invio PING
-				fmt.Fprintf(conn, "PING %s\n", myAddr)
-				log.Printf("[GOSSIP] Inviato PING a %s", a)
-			}(addr)
-		}
-	}
-}
-
-// handleConn elabora JOIN e PING, aggiorna peers e lastSeen
 func handleConn(c net.Conn) {
 	defer c.Close()
+
+	remote := c.RemoteAddr().String()
 	scanner := bufio.NewScanner(c)
 	for scanner.Scan() {
-		parts := strings.Fields(scanner.Text())
-		if len(parts) != 2 {
-			continue
-		}
-		cmd, addr := parts[0], parts[1]
-		switch cmd {
-		case "JOIN":
-			peersMu.Lock()
-			exists := false
-			for _, p := range peers {
-				if p == addr {
-					exists = true
-					break
-				}
-			}
-			if !exists {
-				peers = append(peers, addr)
-				log.Printf("[EVENT] Aggiunto peer: %s", addr)
-				log.Printf("[EVENT] Lista peers: %v", peers)
-				lastSeenMu.Lock()
-				lastSeen[addr] = time.Now()
-				lastSeenMu.Unlock()
-			}
-			peersMu.Unlock()
-		case "PING":
-			lastSeenMu.Lock()
-			lastSeen[addr] = time.Now()
-			lastSeenMu.Unlock()
-			log.Printf("[EVENT] Ricevuto PING da %s", addr)
+		line := strings.TrimSpace(scanner.Text())
+
+		// Passo SEMPRE al parser SWIM (gestisce PING/ACK, ALIVE, SUSPECT, DEAD, ecc.)
+		HandleSWIM(line)
+
+		// Supporto JOIN iniziale (resta fuori da SWIM per semplicità di bootstrap)
+		if strings.HasPrefix(line, "JOIN ") {
+			addr := strings.TrimSpace(strings.TrimPrefix(line, "JOIN"))
+			log.Printf("[JOIN] learned %s from %s", addr, remote)
+			HandleSWIM(fmt.Sprintf("ALIVE %s 0", addr)) // inserisco subito come ALIVE
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
 
 func main() {
 	if len(os.Args) < 4 {
@@ -167,74 +84,42 @@ func main() {
 	}
 	myID := os.Args[1]
 	myAddr := os.Args[2]
-	registry := os.Args[3]
+	registryAddr = os.Args[3]
 
-	// prefisso per i log
 	log.SetPrefix(fmt.Sprintf("[%s] ", myID))
-	log.Printf("[MAIN] Avvio nodo %s, registry=%s", myID, registry)
+	log.Printf("[BOOT] starting node %s  (%s)", myID, myAddr)
 
-	// 1) bootstrap dal registry
-	initial := getPeers(registry, myID, myAddr)
+	// 1) bootstrap
+	initial := getPeers(registryAddr, myID, myAddr)
 
-	// inizializza peers e lastSeen
-	peersMu.Lock()
-	peers = append(peers, initial...)
-	peersMu.Unlock()
-	lastSeenMu.Lock()
-	for _, p := range initial {
-		lastSeen[p] = time.Now()
-	}
-	lastSeenMu.Unlock()
-	log.Printf("[MAIN] Lista peers iniziale: %v", peers)
+	// ---------- [SWIM-INTEGRATION] ----------
+	addInitialPeers(myAddr, initial) // popola la membership con lo snapshot iniziale
+	//----------------------------------------
 
-	// 2) registra la JOIN pendente del nodo stesso
-	joinsMu.Lock()
-	pendingJoins = append(pendingJoins, myAddr)
-	joinsMu.Unlock()
-	log.Printf("[MAIN] JOIN pendente schedulata: %s", myAddr)
+	// 2) registro la JOIN del mio indirizzo (la propaga SWIM come ALIVE)
+	HandleSWIM(fmt.Sprintf("ALIVE %s 0", myAddr))
 
-	// 3) avvia listener per gossip in arrivo
+	// 3) socket in ascolto
 	port := strings.Split(myAddr, ":")[1]
 	ln, err := net.Listen("tcp", ":"+port)
 	if err != nil {
-		log.Fatalf("[MAIN] Listen fallito su %s: %v", myAddr, err)
+		log.Fatalf("[BOOT] listen %s failed: %v", myAddr, err)
 	}
-	log.Printf("[MAIN] Listener avviato su %s", myAddr)
+	log.Printf("[BOOT] listening on %s", myAddr)
 
-	// invia subito le JOIN pendenti, se ci sono peer
-	go announceJoins(myAddr)
-
-	// gestisci connessioni in entrata
 	go func() {
 		for {
 			c, err := ln.Accept()
 			if err != nil {
-				log.Printf("[MAIN] Accept fallito: %v", err)
+				log.Printf("[NET] accept failed: %v", err)
 				continue
 			}
 			go handleConn(c)
 		}
 	}()
 
-	// 4) avvia gossip loop
-	go gossipLoop(myAddr)
-	log.Println("[MAIN] Gossip avviato")
-
-	// 5) avvia fault detector
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		for range ticker.C {
-			lastSeenMu.Lock()
-			for p, ts := range lastSeen {
-				if time.Since(ts) > 10*time.Second {
-					log.Printf("[FAULT] Peer %s considerato DEAD", p)
-					delete(lastSeen, p)
-				}
-			}
-			lastSeenMu.Unlock()
-		}
-	}()
-	log.Println("[MAIN] Fault detector avviato")
-
+	// ---------- [SWIM-INTEGRATION] ----------
+	StartSWIM(myAddr) // parte la probe-loop (non ritorna)
+	//----------------------------------------
 	select {}
 }

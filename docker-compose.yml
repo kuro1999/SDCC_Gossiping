@@ -1,3 +1,4 @@
+
 services:
   registry:
     build:
@@ -10,11 +11,12 @@ services:
       - "${REGISTRY_PORT}:${REGISTRY_PORT}"
 
   node1:
+    container_name: node1
     build:
       context: ./node
       dockerfile: Dockerfile.node
     image: gossip-node
-    command: ["./node", "${NODE_1_ID}", "node1:8000", "registry:${REGISTRY_PORT}"]
+    command: ["sh", "-c", "sleep $((RANDOM % ${MAX_START_DELAY})) && exec ./node ${NODE_1_ID} node1:8000 registry:${REGISTRY_PORT}"]
     ports:
       - "8000:8000"
     depends_on:
@@ -22,26 +24,45 @@ services:
     restart: unless-stopped
 
   node2:
+    container_name: node2
     build:
       context: ./node
       dockerfile: Dockerfile.node
     image: gossip-node
-    command: ["./node", "${NODE_2_ID}", "node2:8000", "registry:${REGISTRY_PORT}"]
+    command: ["sh", "-c", "sleep $((RANDOM % ${MAX_START_DELAY})) && exec ./node ${NODE_2_ID} node2:8000 registry:${REGISTRY_PORT}"]
     ports:
       - "8001:8000"
     depends_on:
       - registry
     restart: unless-stopped
 
-
   node3:
+    container_name: node3
     build:
       context: ./node
       dockerfile: Dockerfile.node
     image: gossip-node
-    command: ["./node", "${NODE_3_ID}", "node3:8000", "registry:${REGISTRY_PORT}"]
+    command: ["sh", "-c", "sleep $((RANDOM % ${MAX_START_DELAY})) && exec ./node ${NODE_3_ID} node3:8000 registry:${REGISTRY_PORT}"]
     ports:
       - "8002:8000"
     depends_on:
       - registry
     restart: unless-stopped
+
+  orchestrator:
+    container_name: orchestrator
+    image: docker:20.10
+    depends_on:
+      - node1
+      - node2
+      - node3
+    environment:
+      - PAUSE_AFTER=${PAUSE_AFTER}
+      - PAUSE_DURATION=${PAUSE_DURATION}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./orchestrator.sh:/orchestrator.sh:ro
+    entrypoint:
+      - /orchestrator.sh
+    restart: "no"
+
