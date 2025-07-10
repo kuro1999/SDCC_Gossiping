@@ -49,6 +49,32 @@ services:
       - registry
     restart: unless-stopped
 
+  node4:
+    container_name: node4
+    build:
+      context: ./node
+      dockerfile: Dockerfile.node
+    image: gossip-node
+    command: [ "sh", "-c", "sleep $((RANDOM % ${MAX_START_DELAY})) && exec ./node ${NODE_4_ID} node4:8000 registry:${REGISTRY_PORT}" ]
+    ports:
+      - "8003:8000"
+    depends_on:
+      - registry
+    restart: unless-stopped
+
+  node5:
+    container_name: node5
+    build:
+      context: ./node
+      dockerfile: Dockerfile.node
+    image: gossip-node
+    command: [ "sh", "-c", "sleep $((RANDOM % ${MAX_START_DELAY})) && exec ./node ${NODE_5_ID} node5:8000 registry:${REGISTRY_PORT}" ]
+    ports:
+      - "8004:8000"
+    depends_on:
+      - registry
+    restart: unless-stopped
+
   orchestrator:
     container_name: orchestrator
     image: docker:20.10

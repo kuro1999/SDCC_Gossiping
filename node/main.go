@@ -10,27 +10,42 @@ import (
 	"time"
 )
 
-// ---------- [SWIM-INTEGRATION] ----------
 /*
-   swim.go (stesso package main) espone:
-
-   // inizializza tabelle interne e parte la probe-loop
-   func StartSWIM(myAddr string)
-
-   // inserisce peer già noti come ALIVE (incarnation 0)
-   func AddInitialPeers(peers []string)
-
-   // parser/dispatcher per tutti i frame SWIM
-   func HandleSWIM(msg string)
+   swim.go espone:
+     StartSWIM(myAddr string, registryAddr string)
+     addInitialPeers(myAddr string, peers []string)
+     HandleSWIM(msg string)
 */
-//----------------------------------------
 
-var registryAddr string // per le chiamate dirette / JOIN bootstrap
+// -------------------------------------------------------------------
+// utilità di rete
+// -------------------------------------------------------------------
+func sendFrame(dest, format string, a ...any) {
+	conn, err := net.DialTimeout("tcp", dest, 2*time.Second)
+	if err != nil {
+		log.Printf("[NET] dial %s failed: %v", dest, err)
+		return
+	}
+	fmt.Fprintf(conn, format, a...)
+	_ = conn.Close()
+}
 
-// init: timestamp + prefix nel logger
-func init() { log.SetFlags(0) }
+// -------------------------------------------------------------------
+// broadcast JOIN
+// -------------------------------------------------------------------
+func broadcastJoin(myAddr string, peers []string) {
+	for _, p := range peers {
+		if p == myAddr {
+			continue
+		}
+		go sendFrame(p, "JOIN %s\n", myAddr)
+		log.Printf("[JOIN] sent JOIN to %s", p)
+	}
+}
 
-// getPeers → invariato: contatta il registry e restituisce gli indirizzi noti
+// -------------------------------------------------------------------
+// bootstrap dal registry
+// -------------------------------------------------------------------
 func getPeers(registryAddr, myID, myAddr string) []string {
 	for {
 		conn, err := net.Dial("tcp", registryAddr)
@@ -53,30 +68,82 @@ func getPeers(registryAddr, myID, myAddr string) []string {
 	}
 }
 
-// -------------------------------- LISTENER ----------------------------------
-
+// -------------------------------------------------------------------
+// listener TCP
+// -------------------------------------------------------------------
 func handleConn(c net.Conn) {
 	defer c.Close()
-
-	remote := c.RemoteAddr().String()
 	scanner := bufio.NewScanner(c)
+	remote := c.RemoteAddr().String()
+
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 
-		// Passo SEMPRE al parser SWIM (gestisce PING/ACK, ALIVE, SUSPECT, DEAD, ecc.)
-		HandleSWIM(line)
+		parts := strings.Fields(line)
+		switch parts[0] {
+		case "PING":
+			// formato: PING <originAddr>
+			if len(parts) == 2 {
+				origin := parts[1]
 
-		// Supporto JOIN iniziale (resta fuori da SWIM per semplicità di bootstrap)
-		if strings.HasPrefix(line, "JOIN ") {
-			addr := strings.TrimSpace(strings.TrimPrefix(line, "JOIN"))
-			log.Printf("[JOIN] learned %s from %s", addr, remote)
-			HandleSWIM(fmt.Sprintf("ALIVE %s 0", addr)) // inserisco subito come ALIVE
+				// 1) il mittente è vivo
+				HandleSWIM(fmt.Sprintf("ALIVE %s 0", origin))
+
+				// 2) rispondiamo **con una connessione nuova**, non su 'c'
+				go func() {
+					// l’ACK deve contenere l’indirizzo del bersaglio del ping,
+					// cioè il nostro (selfAddr).
+					sendFrame(origin, "ACK %s\n", selfAddr)
+				}()
+
+				// 3) piggy-back (eventi nostri) sulla stessa connessione entrante
+				//    finché è aperta – opzionale ma comodo.
+				sendPiggyback(c)
+			}
+
+		case "ACK":
+			// formato: ACK <who>
+			if len(parts) == 2 {
+				addr := parts[1]
+				HandleSWIM(fmt.Sprintf("ACK %s", addr)) // mette su ackCh
+				// nessun bisogno di piggy-back qui
+			}
+
+		case "PING-REQ":
+			// formato: PING-REQ <target> <origin>
+			if len(parts) == 3 {
+				target, origin := parts[1], parts[2]
+
+				// lanciamo un ping diretto al bersaglio
+				go func() {
+					if directPing(target, origin) {
+						// se riceviamo l’ACK dal target, giriamo un ACK all’origin
+						sendFrame(origin, "ACK %s\n", target)
+					}
+				}()
+				// niente risposta immediata al proxy-caller
+			}
+
+		case "JOIN":
+			addr := parts[1]
+			updateFromRemote(EvJoin, addr, 0)
+			sendPiggyback(c)
+
+		default:
+			// tutte le altre righe (EVT piggyback o comandi custom)
+			HandleSWIM(line)
+			sendPiggyback(c)
 		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.Printf("[NET] scanner error from %s: %v", remote, err)
 	}
 }
 
-// ---------------------------------------------------------------------------
-
+// -------------------------------------------------------------------
+// main
+// -------------------------------------------------------------------
 func main() {
 	if len(os.Args) < 4 {
 		log.Println("Usage: node <myID> <myAddr> <registryAddr>")
@@ -84,29 +151,33 @@ func main() {
 	}
 	myID := os.Args[1]
 	myAddr := os.Args[2]
-	registryAddr = os.Args[3]
+	registryAddr := os.Args[3]
 
+	log.SetFlags(0)
 	log.SetPrefix(fmt.Sprintf("[%s] ", myID))
 	log.Printf("[BOOT] starting node %s  (%s)", myID, myAddr)
 
-	// 1) bootstrap
+	// 1) snapshot iniziale
 	initial := getPeers(registryAddr, myID, myAddr)
 
-	// ---------- [SWIM-INTEGRATION] ----------
-	addInitialPeers(myAddr, initial) // popola la membership con lo snapshot iniziale
-	//----------------------------------------
+	// 2) membership locale
+	addInitialPeers(myAddr, initial)
 
-	// 2) registro la JOIN del mio indirizzo (la propaga SWIM come ALIVE)
+	// 3) JOIN gossip
+	if len(initial) > 0 {
+		broadcastJoin(myAddr, initial)
+	}
+
+	// 4) me stesso ALIVE inc=0
 	HandleSWIM(fmt.Sprintf("ALIVE %s 0", myAddr))
 
-	// 3) socket in ascolto
+	// 5) listener
 	port := strings.Split(myAddr, ":")[1]
 	ln, err := net.Listen("tcp", ":"+port)
 	if err != nil {
 		log.Fatalf("[BOOT] listen %s failed: %v", myAddr, err)
 	}
 	log.Printf("[BOOT] listening on %s", myAddr)
-
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -118,8 +189,8 @@ func main() {
 		}
 	}()
 
-	// ---------- [SWIM-INTEGRATION] ----------
-	StartSWIM(myAddr) // parte la probe-loop (non ritorna)
-	//----------------------------------------
-	select {}
+	// 6) failure detector
+	StartSWIM(myAddr, initial, registryAddr)
+
+	select {} // blocca
 }

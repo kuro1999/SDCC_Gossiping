@@ -1,5 +1,4 @@
-// registry.go – compatibile con SWIM
-
+// registry.go – compatibile con SWIM + quorum-based DEAD removal
 package main
 
 import (
@@ -22,6 +21,11 @@ type Peer struct {
 var (
 	peers   []Peer
 	peersMu sync.Mutex
+
+	// reports[victim] = set di reporter che lo hanno dichiarato DEAD
+	reports = map[string]map[string]struct{}{}
+
+	quorumFrac = 0.5 // maggioranza semplice: > N/2
 )
 
 // ------------------------------------------------------------------
@@ -52,6 +56,7 @@ func removePeer(addr string) {
 		}
 	}
 	peers = newPeers
+	delete(reports, addr) // pulizia eventuali report pendenti
 }
 
 // ------------------------------------------------------------------
@@ -69,40 +74,60 @@ func handleConn(conn net.Conn) {
 	}
 	line = strings.TrimSpace(line)
 	fields := strings.Fields(line)
-	if len(fields) != 2 {
+	if len(fields) < 2 {
 		log.Printf("[REGISTRY] malformed line: %q", line)
 		return
 	}
 	cmd, arg := fields[0], fields[1]
 
 	switch cmd {
-	case "FAIL":
+
+	// --------------------------------------------------------------
+	case "DEAD": // formato: DEAD <victimAddr>
+		victim := arg
+		reporter := strings.Split(conn.RemoteAddr().String(), ":")[0] // IP del reporter
+
 		peersMu.Lock()
-		removePeer(arg)
+		if reports[victim] == nil {
+			reports[victim] = map[string]struct{}{}
+		}
+		reports[victim][reporter] = struct{}{}
+
+		aliveCnt := len(peers)            // nodi vivi registrati
+		reportCnt := len(reports[victim]) // quanti hanno segnalato
+
+		log.Printf("[REGISTRY] DEAD report: %s by %s (%d/%d)", victim, reporter, reportCnt, aliveCnt)
+
+		if float64(reportCnt) > quorumFrac*float64(aliveCnt) {
+			removePeer(victim)
+			log.Printf("[REGISTRY] %s removed (quorum reached)", victim)
+		}
 		peersMu.Unlock()
-		log.Printf("[REGISTRY] Peer %s removed (FAIL)", arg)
 		return
 
-	case "LEAVE":
+	// --------------------------------------------------------------
+	case "FAIL", "LEAVE":
 		peersMu.Lock()
 		removePeer(arg)
 		peersMu.Unlock()
-		log.Printf("[REGISTRY] Peer %s removed (LEAVE)", arg)
+		log.Printf("[REGISTRY] Peer %s removed (%s)", arg, cmd)
 		return
 
 	case "ALIVE":
 		peersMu.Lock()
-		addPeer(arg, arg) // ID = addr se non noto
+		delete(reports, arg) // <-- se era stato acusato, azzera i report
+		addPeer(arg, arg)    // (ri)aggiungi
 		peersMu.Unlock()
 		log.Printf("[REGISTRY] Peer %s resurrected (ALIVE)", arg)
 		return
 
-		// dentro handleConn, versione minimale:
+	// --------------------------------------------------------------
 	default:
+		// registrazione classica: <nodeID> <nodeAddr>
 		nodeID, nodeAddr := cmd, arg
 		peersMu.Lock()
 		for _, p := range peers {
-			fmt.Fprintln(conn, p.Addr)
+			fmt.Fprintln(conn, p.Addr) // invia la lista corrente
 		}
 		addPeer(nodeID, nodeAddr)
 		log.Printf("[REGISTRY] Registered Node: %s (%s)", nodeID, nodeAddr)
