@@ -1,4 +1,3 @@
-// registry.go – compatibile con SWIM + quorum-based DEAD removal
 package main
 
 import (
@@ -13,6 +12,12 @@ import (
 )
 
 func init() { log.SetFlags(0) }
+
+// grace period before final removal after quorum DEAD
+var (
+	gracePeriod     = 20 * time.Second
+	pendingRemovals = make(map[string]*time.Timer)
+)
 
 type Peer struct {
 	ID   string
@@ -99,12 +104,13 @@ func handleConn(conn net.Conn) {
 		reporterIP := strings.Split(conn.RemoteAddr().String(), ":")[0]
 
 		peersMu.Lock()
-		if !peerExists(victim) { // 3. già rimosso
-			peersMu.Unlock()
+		defer peersMu.Unlock()
+
+		if !peerExists(victim) { // già rimosso
 			return
 		}
 
-		// 2. mappa IP → addr completo (best-effort)
+		// mappa IP → addr completo (best-effort)
 		reporterAddr := reporterIP
 		for _, p := range peers {
 			if strings.Split(p.Addr, ":")[0] == reporterIP {
@@ -121,20 +127,31 @@ func handleConn(conn net.Conn) {
 		aliveCnt := len(peers)
 		if peerExists(victim) {
 			aliveCnt--
-		} // 1. escludi victim
-
+		}
 		reportCnt := len(reports[victim])
 		log.Printf("[REGISTRY] DEAD report: %s by %s (%d/%d)", victim, reporterAddr, reportCnt, aliveCnt)
 
-		if float64(reportCnt) > quorumFrac*float64(aliveCnt) { // > N/2
-
-			removePeer(victim)
-			log.Printf("[REGISTRY] %s removed (quorum reached)", victim)
-			for _, peer := range peers {
-				go sendFrame(peer.Addr, "REMOVE %s from peers\n", victim)
+		if float64(reportCnt) > quorumFrac*float64(aliveCnt) {
+			// schedule final removal after gracePeriod
+			if timer := pendingRemovals[victim]; timer != nil {
+				timer.Stop()
 			}
+			pendingRemovals[victim] = time.AfterFunc(gracePeriod, func() {
+				peersMu.Lock()
+				defer peersMu.Unlock()
+
+				if peerExists(victim) {
+					removePeer(victim)
+					log.Printf("[REGISTRY] %s removed after grace period", victim)
+					for _, peer := range peers {
+						go sendFrame(peer.Addr, "REMOVE %s\n", victim)
+					}
+				}
+				delete(pendingRemovals, victim)
+			})
+			log.Printf("[REGISTRY] scheduled removal of %s in %s", victim, gracePeriod)
 		}
-		peersMu.Unlock()
+
 		return
 
 	// --------------------------------------------------------------
@@ -147,8 +164,14 @@ func handleConn(conn net.Conn) {
 
 	case "ALIVE":
 		peersMu.Lock()
-		delete(reports, arg) // <-- se era stato acusato, azzera i report
-		addPeer(arg, arg)    // (ri)aggiungi
+		// cancel pending removal if any
+		if timer := pendingRemovals[arg]; timer != nil {
+			timer.Stop()
+			delete(pendingRemovals, arg)
+			log.Printf("[REGISTRY] canceled removal of %s (ALIVE)", arg)
+		}
+		delete(reports, arg) // azzera i report
+		addPeer(arg, arg)
 		peersMu.Unlock()
 		log.Printf("[REGISTRY] Peer %s resurrected (ALIVE)", arg)
 		return
@@ -159,7 +182,7 @@ func handleConn(conn net.Conn) {
 		nodeID, nodeAddr := cmd, arg
 		peersMu.Lock()
 		for _, p := range peers {
-			fmt.Fprintln(conn, p.Addr) // invia la lista corrente
+			fmt.Fprintln(conn, p.Addr)
 		}
 		addPeer(nodeID, nodeAddr)
 		log.Printf("[REGISTRY] Registered Node: %s (%s)", nodeID, nodeAddr)

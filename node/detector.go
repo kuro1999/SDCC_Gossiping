@@ -116,7 +116,7 @@ func addInitialPeers(myAddr string, peers []string) {
 
 func updateFromRemote(kind EventType, addr string, inc uint64) {
 	e := Event{Kind: kind, Addr: addr, Incarnation: inc, HopsLeft: gossipTTL}
-	if alreadySeen(e) {
+	if alreadySeen(e) && kind != EvAlive { // ALIVE va sempre avanti
 		return
 	}
 	enqueue(e)
@@ -124,6 +124,9 @@ func updateFromRemote(kind EventType, addr string, inc uint64) {
 	memMu.Lock()
 	defer memMu.Unlock()
 
+	//-----------------------------------------------------------------
+	// 1) SELF-DEFENCE (se qualcuno ci dà per morti)
+	//-----------------------------------------------------------------
 	if addr == selfAddr && kind != EvAlive {
 		self := members[selfAddr]
 		self.Incarnation++
@@ -132,53 +135,64 @@ func updateFromRemote(kind EventType, addr string, inc uint64) {
 		enqueue(Event{Kind: EvAlive, Addr: selfAddr, Incarnation: self.Incarnation, HopsLeft: gossipTTL})
 		log.Printf("[SWIM] self-defence → ALIVE (inc=%d)", self.Incarnation)
 		go notifyRegistryAlive(selfAddr)
+		go gossipNow() // fan-out immediato
 		return
 	}
 
+	//-----------------------------------------------------------------
+	// 2) se non esiste ancora, crea l’entry – MA solo per ALIVE/JOIN
+	//-----------------------------------------------------------------
 	m, ok := members[addr]
-	if !ok {
+	if !ok && (kind == EvAlive || kind == EvJoin) {
 		m = &Member{Addr: addr}
 		members[addr] = m
+	} else if !ok { // ignoriamo SUSPECT/DEAD di ignoti
+		return
 	}
 
-	if kind == EvJoin {
-		if !ok {
+	//-----------------------------------------------------------------
+	// 3) gestione stato in base al tipo di evento
+	//-----------------------------------------------------------------
+	switch kind {
+
+	case EvJoin:
+		if inc >= m.Incarnation {
 			*m = Member{Addr: addr, State: Alive, Incarnation: inc, LastAck: time.Now()}
 			log.Printf("[SWIM] %s → JOINED (inc=%d)", addr, inc)
 			go notifyRegistryAlive(addr)
-		} else if m.State != Alive {
-			m.State = Alive
-			m.LastAck = time.Now()
+			go gossipNow()
 		}
-		return
-	}
 
-	if inc < m.Incarnation {
-		return
-	}
-	m.Incarnation = inc
-
-	switch kind {
 	case EvAlive:
+		if inc < m.Incarnation {
+			return
+		}
 		if m.State == Dead {
 			log.Printf("[SWIM] %s resurrected → ALIVE (inc=%d)", addr, inc)
 			go notifyRegistryAlive(addr)
+			go gossipNow()
 		}
 		m.State = Alive
+		m.Incarnation = inc
 		m.LastAck = time.Now()
 
 	case EvSuspect:
-		if m.State == Alive {
-			log.Printf("[SWIM] %s → SUSPECT (inc=%d)", addr, inc)
-			m.State = Suspect
+		if inc < m.Incarnation || m.State != Alive {
+			return
 		}
+		m.State = Suspect
+		m.Incarnation = inc
+		log.Printf("[SWIM] %s → SUSPECT (inc=%d)", addr, inc)
 
 	case EvDead:
-		if m.State != Dead {
-			log.Printf("[SWIM] %s → DEAD (inc=%d)", addr, inc)
-			go notifyRegistryDead(addr)
+		if inc < m.Incarnation || m.State == Dead {
+			return
 		}
 		m.State = Dead
+		m.Incarnation = inc
+		log.Printf("[SWIM] %s → DEAD (inc=%d)", addr, inc)
+		go notifyRegistryDead(addr)
+		go gossipNow()
 	}
 }
 
@@ -202,6 +216,7 @@ func recordAck(addr string) {
 			enqueue(Event{Kind: EvAlive, Addr: addr, Incarnation: m.Incarnation, HopsLeft: gossipTTL})
 			log.Printf("[SWIM] %s resurrected (ACK)", addr)
 			go notifyRegistryAlive(addr)
+			go gossipNow() // fan-out immediato dell’ALIVE
 		}
 		m.LastAck = time.Now()
 	}
@@ -351,8 +366,7 @@ func markDead(addr string) {
 		enqueue(Event{Kind: EvDead, Addr: addr, Incarnation: m.Incarnation, HopsLeft: gossipTTL})
 		log.Printf("[SWIM] mark DEAD %s (inc=%d)", addr, m.Incarnation)
 		go notifyRegistryDead(addr)
-		//------GOSSIP IMMEDIATO---------
-		go gossipNow() //fan out immediato ai peer ALIVE
+		go gossipNow() // <-- disseminazione immediata
 	}
 	memMu.Unlock()
 }
