@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"os"
 	"strings"
@@ -30,9 +31,10 @@ var (
 
 	// reports[victim] = set di reporter che lo hanno dichiarato DEAD
 	reports = map[string]map[string]struct{}{}
-
-	quorumFrac = 0.5 // maggioranza semplice: > N/2
 )
+
+// durata del grace period in secondi
+const gracePeriodSec = 20
 
 // ------------------------------------------------------------------
 // utilità
@@ -98,7 +100,6 @@ func handleConn(conn net.Conn) {
 
 	switch cmd {
 
-	// --------------------------------------------------------------
 	case "DEAD":
 		victim := arg
 		reporterIP := strings.Split(conn.RemoteAddr().String(), ":")[0]
@@ -106,56 +107,70 @@ func handleConn(conn net.Conn) {
 		peersMu.Lock()
 		defer peersMu.Unlock()
 
-		if !peerExists(victim) { // già rimosso
+		if !peerExists(victim) {
 			return
 		}
 
-		// mappa IP → addr completo (best-effort)
+		// ricava indirizzo completo e ID di reporter e victim
 		reporterAddr := reporterIP
+		var reporterID, victimID string
 		for _, p := range peers {
 			if strings.Split(p.Addr, ":")[0] == reporterIP {
 				reporterAddr = p.Addr
-				break
+			}
+			if p.Addr == reporterAddr {
+				reporterID = p.ID
+			}
+			if p.Addr == victim {
+				victimID = p.ID
 			}
 		}
 
+		// aggiorna i report
 		if reports[victim] == nil {
 			reports[victim] = map[string]struct{}{}
 		}
 		reports[victim][reporterAddr] = struct{}{}
 
-		aliveCnt := len(peers)
-		if peerExists(victim) {
-			aliveCnt--
-		}
 		reportCnt := len(reports[victim])
-		log.Printf("[REGISTRY] DEAD report: %s by %s (%d/%d)", victim, reporterAddr, reportCnt, aliveCnt)
+		total := len(peers)
+		quorum := int(math.Floor(0.5*float64(total))) + 1
 
-		if float64(reportCnt) > quorumFrac*float64(aliveCnt) {
-			// schedule final removal after gracePeriod
-			if timer := pendingRemovals[victim]; timer != nil {
-				timer.Stop()
-			}
-			pendingRemovals[victim] = time.AfterFunc(gracePeriod, func() {
-				peersMu.Lock()
-				defer peersMu.Unlock()
+		// 1) LOG dei singoli report SOLO se non abbiamo già schedulato la removal
+		if _, scheduled := pendingRemovals[victim]; !scheduled {
+			log.Printf(
+				"[REGISTRY] DEAD report: %s(%s) by %s(%s) (%d/%d)",
+				victimID, victim, reporterID, reporterAddr, reportCnt, quorum,
+			)
+		}
 
-				if peerExists(victim) {
+		// 2) Schedula la rimozione al primo superamento quorum
+		if reportCnt >= quorum {
+			if _, exists := pendingRemovals[victim]; !exists {
+				log.Printf(
+					"[REGISTRY] scheduled removal of %s(%s) in %ds",
+					victimID, victim, gracePeriodSec,
+				)
+				pendingRemovals[victim] = time.AfterFunc(gracePeriod, func() {
+					peersMu.Lock()
+					defer peersMu.Unlock()
+
 					removePeer(victim)
-					log.Printf("[REGISTRY] %s removed after grace period", victim)
+					log.Printf(
+						"[REGISTRY] %s(%s) removed after grace period",
+						victimID, victim,
+					)
+
 					for _, peer := range peers {
 						go sendFrame(peer.Addr, "REMOVE %s\n", victim)
 					}
-				}
-				delete(pendingRemovals, victim)
-			})
-			log.Printf("[REGISTRY] scheduled removal of %s in %s", victim, gracePeriod)
+					delete(pendingRemovals, victim)
+				})
+			}
 		}
-
 		return
 
-	// --------------------------------------------------------------
-	case "FAIL", "LEAVE":
+	case "FAIL":
 		peersMu.Lock()
 		removePeer(arg)
 		peersMu.Unlock()
@@ -164,19 +179,24 @@ func handleConn(conn net.Conn) {
 
 	case "ALIVE":
 		peersMu.Lock()
-		// cancel pending removal if any
-		if timer := pendingRemovals[arg]; timer != nil {
-			timer.Stop()
+		if t, ok := pendingRemovals[arg]; ok {
+			t.Stop()
 			delete(pendingRemovals, arg)
 			log.Printf("[REGISTRY] canceled removal of %s (ALIVE)", arg)
 		}
-		delete(reports, arg) // azzera i report
+		delete(reports, arg)
 		addPeer(arg, arg)
 		peersMu.Unlock()
 		log.Printf("[REGISTRY] Peer %s resurrected (ALIVE)", arg)
 		return
 
-	// --------------------------------------------------------------
+	case "LEAVE":
+		peersMu.Lock()
+		removePeer(arg)
+		peersMu.Unlock()
+		log.Printf("[REGISTRY] Peer %s removed (LEAVE)", arg)
+		return
+
 	default:
 		// registrazione classica: <nodeID> <nodeAddr>
 		nodeID, nodeAddr := cmd, arg

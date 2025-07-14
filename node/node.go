@@ -103,8 +103,6 @@ func handleConn(c net.Conn) {
 				continue
 			}
 			addr := parts[1]
-
-			// chiudiamo e cancelliamo il waiter in un solo colpo
 			if chAny, ok := ackWaiters.LoadAndDelete(addr); ok {
 				close(chAny.(chan struct{}))
 			}
@@ -137,6 +135,22 @@ func handleConn(c net.Conn) {
 			delete(members, target)
 			memMu.Unlock()
 			log.Printf("[SWIM] Removed from %s", target)
+
+		case "LEAVE":
+			if len(parts) < 2 {
+				continue
+			}
+			victim := parts[1]
+			if victim == selfAddr {
+				// voluntary leave indirizzato a me → faccio l’uscita ordinata
+				gracefulLeave()
+			} else {
+				// leave di un altro peer: lo rimuovo dalla mia membership
+				memMu.Lock()
+				delete(members, victim)
+				memMu.Unlock()
+				log.Printf("[SWIM] %s voluntarily left", victim)
+			}
 
 		default:
 			HandleSWIM(line)

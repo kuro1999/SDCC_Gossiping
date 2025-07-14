@@ -8,10 +8,8 @@ import (
 	"math/rand"
 	"net"
 	"os"
-	"os/signal"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -63,7 +61,8 @@ var (
 type EventType int
 
 const (
-	EvJoin EventType = iota
+	EvJoin  EventType = iota
+	EvLeave           // <- nuovo
 	EvSuspect
 	EvDead
 	EvAlive
@@ -73,6 +72,8 @@ func (t EventType) String() string {
 	switch t {
 	case EvJoin:
 		return "JOIN"
+	case EvLeave:
+		return "LEAVE"
 	case EvSuspect:
 		return "SUSPECT"
 	case EvDead:
@@ -116,7 +117,9 @@ func addInitialPeers(myAddr string, peers []string) {
 
 func updateFromRemote(kind EventType, addr string, inc uint64) {
 	e := Event{Kind: kind, Addr: addr, Incarnation: inc, HopsLeft: gossipTTL}
-	if alreadySeen(e) && kind != EvAlive { // ALIVE va sempre avanti
+
+	// deduplica: solo ALIVE viaggia sempre
+	if alreadySeen(e) && kind != EvAlive {
 		return
 	}
 	enqueue(e)
@@ -124,9 +127,9 @@ func updateFromRemote(kind EventType, addr string, inc uint64) {
 	memMu.Lock()
 	defer memMu.Unlock()
 
-	//-----------------------------------------------------------------
-	// 1) SELF-DEFENCE (se qualcuno ci dà per morti)
-	//-----------------------------------------------------------------
+	// -----------------------------------------------------------------
+	// 1) SELF-DEFENCE (se qualcuno ci dà per morti / sospetti / leave)
+	// -----------------------------------------------------------------
 	if addr == selfAddr && kind != EvAlive {
 		self := members[selfAddr]
 		self.Incarnation++
@@ -135,26 +138,25 @@ func updateFromRemote(kind EventType, addr string, inc uint64) {
 		enqueue(Event{Kind: EvAlive, Addr: selfAddr, Incarnation: self.Incarnation, HopsLeft: gossipTTL})
 		log.Printf("[SWIM] self-defence → ALIVE (inc=%d)", self.Incarnation)
 		go notifyRegistryAlive(selfAddr)
-		go gossipNow() // fan-out immediato
+		go gossipNow()
 		return
 	}
 
-	//-----------------------------------------------------------------
-	// 2) se non esiste ancora, crea l’entry – MA solo per ALIVE/JOIN
-	//-----------------------------------------------------------------
+	// -----------------------------------------------------------------
+	// 2) se non esiste l’entry, creala solo per ALIVE o JOIN
+	// -----------------------------------------------------------------
 	m, ok := members[addr]
 	if !ok && (kind == EvAlive || kind == EvJoin) {
 		m = &Member{Addr: addr}
 		members[addr] = m
-	} else if !ok { // ignoriamo SUSPECT/DEAD di ignoti
+	} else if !ok { // ignoriamo SUSPECT / DEAD / LEAVE di ignoti
 		return
 	}
 
-	//-----------------------------------------------------------------
-	// 3) gestione stato in base al tipo di evento
-	//-----------------------------------------------------------------
+	// -----------------------------------------------------------------
+	// 3) transizioni di stato
+	// -----------------------------------------------------------------
 	switch kind {
-
 	case EvJoin:
 		if inc >= m.Incarnation {
 			*m = Member{Addr: addr, State: Alive, Incarnation: inc, LastAck: time.Now()}
@@ -193,17 +195,29 @@ func updateFromRemote(kind EventType, addr string, inc uint64) {
 		log.Printf("[SWIM] %s → DEAD (inc=%d)", addr, inc)
 		go notifyRegistryDead(addr)
 		go gossipNow()
+
+	case EvLeave:
+		// rimuoviamo subito il nodo dalla membership
+		delete(members, addr)
+		log.Printf("[SWIM] %s → voluntarily LEFT", addr)
+		go notifyRegistryLeave(addr)
+		go gossipNow()
 	}
 }
 
+// —————————————————————————————————————————————————
 func updateMember(addr, state string, inc int) {
 	switch state {
+	case "JOIN":
+		updateFromRemote(EvJoin, addr, 0)
 	case "ALIVE":
 		updateFromRemote(EvAlive, addr, uint64(inc))
 	case "SUSPECT":
 		updateFromRemote(EvSuspect, addr, uint64(inc))
 	case "DEAD":
 		updateFromRemote(EvDead, addr, uint64(inc))
+	case "LEAVE":
+		updateFromRemote(EvLeave, addr, 0)
 	}
 }
 
@@ -259,7 +273,6 @@ func StartSWIM(myAddr string, initialPeers []string, reg string) {
 	go antiEntropyLoop()
 	go probeLoop(myAddr)
 	go reaperLoop()
-	go handleGracefulLeave()
 	if dumpInterval > 0 {
 		go dumpMembership()
 	}
@@ -519,7 +532,9 @@ func HandleSWIM(frame string) {
 			close(chAny.(chan struct{}))
 		}
 		recordAck(addr)
-
+	case "LEAVE": // ← NEW
+		log.Printf("[DEBUG] received LEAVE from %s", addr)
+		updateFromRemote(EvLeave, addr, 0)
 	}
 }
 
@@ -543,6 +558,15 @@ func notifyRegistryDead(victim string) {
 		return
 	}
 	fmt.Fprintf(conn, "DEAD %s\n", victim)
+	_ = conn.Close()
+}
+func notifyRegistryLeave(addr string) {
+	conn, err := net.DialTimeout("tcp", registryAddr, 2*time.Second)
+	if err != nil {
+		log.Printf("[SWIM] cannot notify registry LEAVE: %v", err)
+		return
+	}
+	fmt.Fprintf(conn, "LEAVE %s\n", addr)
 	_ = conn.Close()
 }
 
@@ -586,13 +610,16 @@ func antiEntropyLoop() {
 	}
 }
 
-func handleGracefulLeave() {
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
-	<-c
-	// 1) gossip di DEAD per noi stessi
-	markDead(selfAddr)
-	// 2) notifiche registry
-	go notifyRegistryDead(selfAddr)
+// ─────────────────────────────────────────────────────────────────
+func gracefulLeave() {
+	// 1) enque e primo fan-out
+	enqueue(Event{Kind: EvLeave, Addr: selfAddr, Incarnation: 0, HopsLeft: gossipTTL})
+	log.Printf("[SWIM] Initiated graceful leave from %s (gossip)", selfAddr)
+	gossipNow()
+
+	// 3) notifica il registry
+	notifyRegistryLeave(selfAddr)
+
+	// 4) esci
 	os.Exit(0)
 }

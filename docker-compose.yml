@@ -21,7 +21,7 @@ services:
       - "8000:8000"
     depends_on:
       - registry
-    restart: unless-stopped
+    restart: "no"
 
   node2:
     container_name: node2
@@ -34,7 +34,7 @@ services:
       - "8001:8000"
     depends_on:
       - registry
-    restart: unless-stopped
+    restart: "no"
 
   node3:
     container_name: node3
@@ -47,7 +47,7 @@ services:
       - "8002:8000"
     depends_on:
       - registry
-    restart: unless-stopped
+    restart: "no"
 
   node4:
     container_name: node4
@@ -60,7 +60,7 @@ services:
       - "8003:8000"
     depends_on:
       - registry
-    restart: unless-stopped
+    restart: "no"
 
   node5:
     container_name: node5
@@ -73,7 +73,7 @@ services:
       - "8004:8000"
     depends_on:
       - registry
-    restart: unless-stopped
+    restart: "no"
 
   orchestrator:
     container_name: orchestrator
@@ -82,9 +82,13 @@ services:
       - node1
       - node2
       - node3
+      - node4
+      - node5
     environment:
       - PAUSE_AFTER=${PAUSE_AFTER}
       - PAUSE_DURATION=${PAUSE_DURATION}
+      - LEAVE_AFTER=${LEAVE_AFTER}
+      - TARGET=${TARGET}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./orchestrator.sh:/orchestrator.sh:ro
