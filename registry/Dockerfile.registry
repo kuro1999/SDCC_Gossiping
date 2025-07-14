@@ -8,7 +8,7 @@ RUN go mod download
 
 # 2. Copia tutto il sorgente e compila
 COPY . .
-RUN go build -o registry main.go
+RUN go build -o registry registry.go
 
 # Stage runtime
 FROM alpine

@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 func init() { log.SetFlags(0) }
@@ -31,6 +32,16 @@ var (
 // ------------------------------------------------------------------
 // utilità
 // ------------------------------------------------------------------
+
+func sendFrame(dest, format string, a ...any) {
+	conn, err := net.DialTimeout("tcp", dest, 2*time.Second)
+	if err != nil {
+		log.Printf("[NET] dial %s failed: %v", dest, err)
+		return
+	}
+	fmt.Fprintf(conn, format, a...)
+	_ = conn.Close()
+}
 
 func peerExists(addr string) bool {
 	for _, p := range peers {
@@ -83,24 +94,45 @@ func handleConn(conn net.Conn) {
 	switch cmd {
 
 	// --------------------------------------------------------------
-	case "DEAD": // formato: DEAD <victimAddr>
+	case "DEAD":
 		victim := arg
-		reporter := strings.Split(conn.RemoteAddr().String(), ":")[0] // IP del reporter
+		reporterIP := strings.Split(conn.RemoteAddr().String(), ":")[0]
 
 		peersMu.Lock()
+		if !peerExists(victim) { // 3. già rimosso
+			peersMu.Unlock()
+			return
+		}
+
+		// 2. mappa IP → addr completo (best-effort)
+		reporterAddr := reporterIP
+		for _, p := range peers {
+			if strings.Split(p.Addr, ":")[0] == reporterIP {
+				reporterAddr = p.Addr
+				break
+			}
+		}
+
 		if reports[victim] == nil {
 			reports[victim] = map[string]struct{}{}
 		}
-		reports[victim][reporter] = struct{}{}
+		reports[victim][reporterAddr] = struct{}{}
 
-		aliveCnt := len(peers)            // nodi vivi registrati
-		reportCnt := len(reports[victim]) // quanti hanno segnalato
+		aliveCnt := len(peers)
+		if peerExists(victim) {
+			aliveCnt--
+		} // 1. escludi victim
 
-		log.Printf("[REGISTRY] DEAD report: %s by %s (%d/%d)", victim, reporter, reportCnt, aliveCnt)
+		reportCnt := len(reports[victim])
+		log.Printf("[REGISTRY] DEAD report: %s by %s (%d/%d)", victim, reporterAddr, reportCnt, aliveCnt)
 
-		if float64(reportCnt) > quorumFrac*float64(aliveCnt) {
+		if float64(reportCnt) > quorumFrac*float64(aliveCnt) { // > N/2
+
 			removePeer(victim)
 			log.Printf("[REGISTRY] %s removed (quorum reached)", victim)
+			for _, peer := range peers {
+				go sendFrame(peer.Addr, "REMOVE %s from peers\n", victim)
+			}
 		}
 		peersMu.Unlock()
 		return

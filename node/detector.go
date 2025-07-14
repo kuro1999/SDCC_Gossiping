@@ -1,5 +1,5 @@
-// swim.go — minimal SWIM‑like detector & membership service (with debug logs)
-// -----------------------------------------------------------------------------
+// swim.go — minimal SWIM-like detector & membership service
+// -------------------------------------------------------------------------
 package main
 
 import (
@@ -7,14 +7,13 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
-
-// -------------------------------------------------------------
-// 1.  Membership record & states
-// -------------------------------------------------------------
 
 type State int
 
@@ -47,21 +46,20 @@ type Member struct {
 }
 
 var (
-	members  = map[string]*Member{}
-	memMu    sync.Mutex
-	eventQ   []Event
-	evMu     sync.Mutex
-	selfAddr string
-	ackCh    = make(chan string, 16)
-
-	// riempito da StartSWIM per i notifier verso il registry
+	members      = map[string]*Member{}
+	memMu        sync.Mutex
+	eventQ       []Event
+	evMu         sync.Mutex
+	selfAddr     string
+	ackWaiters   sync.Map // key = addr, value = chan struct{}
 	registryAddr string
+	seenMu       sync.Mutex
+	seen         = map[string]uint64{} // key = kind|addr -> last incarnation
 )
 
 // -------------------------------------------------------------
 // 2.  Events disseminated via gossip
 // -------------------------------------------------------------
-
 type EventType int
 
 const (
@@ -90,7 +88,7 @@ type Event struct {
 	Kind        EventType
 	Addr        string
 	Incarnation uint64
-	HopsLeft    int // nuovo
+	HopsLeft    int
 }
 
 func enqueue(e Event) {
@@ -100,9 +98,8 @@ func enqueue(e Event) {
 }
 
 // -------------------------------------------------------------
-// 3.  SWIM hooks per node.go
+// 3.  SWIM hooks richiamati da node.go
 // -------------------------------------------------------------
-
 func addInitialPeers(myAddr string, peers []string) {
 	memMu.Lock()
 	defer memMu.Unlock()
@@ -118,7 +115,6 @@ func addInitialPeers(myAddr string, peers []string) {
 }
 
 func updateFromRemote(kind EventType, addr string, inc uint64) {
-	// 1) costruisci subito l’evento e scarta i duplicati
 	e := Event{Kind: kind, Addr: addr, Incarnation: inc, HopsLeft: gossipTTL}
 	if alreadySeen(e) {
 		return
@@ -128,9 +124,6 @@ func updateFromRemote(kind EventType, addr string, inc uint64) {
 	memMu.Lock()
 	defer memMu.Unlock()
 
-	// ------------------------------------------------------------------
-	//  AUTO-RESURRECTION: se sono io e non è un alive, mi difendo
-	// ------------------------------------------------------------------
 	if addr == selfAddr && kind != EvAlive {
 		self := members[selfAddr]
 		self.Incarnation++
@@ -142,50 +135,50 @@ func updateFromRemote(kind EventType, addr string, inc uint64) {
 		return
 	}
 
-	// 2) normal processing: crea il membro se non esiste
 	m, ok := members[addr]
 	if !ok {
 		m = &Member{Addr: addr}
 		members[addr] = m
 	}
 
-	// 3) accetta solo incarnation più nuove
-	if inc >= m.Incarnation {
-		m.Incarnation = inc
-
-		switch kind {
-		case EvJoin:
-			// se non lo conosciamo ancora, lo aggiungiamo subito come Alive
-			if _, exists := members[addr]; !exists {
-				members[addr] = &Member{
-					Addr: addr, State: Alive, Incarnation: inc, LastAck: time.Now(),
-				}
-				log.Printf("[SWIM] %s → JOINED (inc=%d)", addr, inc)
-				go notifyRegistryAlive(addr)
-			}
-			return
-		case EvAlive:
-			if m.State == Dead {
-				log.Printf("[SWIM] %s resurrected → ALIVE (inc=%d)", addr, inc)
-				go notifyRegistryAlive(addr)
-			}
+	if kind == EvJoin {
+		if !ok {
+			*m = Member{Addr: addr, State: Alive, Incarnation: inc, LastAck: time.Now()}
+			log.Printf("[SWIM] %s → JOINED (inc=%d)", addr, inc)
+			go notifyRegistryAlive(addr)
+		} else if m.State != Alive {
 			m.State = Alive
 			m.LastAck = time.Now()
+		}
+		return
+	}
 
-		case EvSuspect:
-			if m.State == Alive {
-				log.Printf("[SWIM] %s → SUSPECT (inc=%d)", addr, inc)
-				m.State = Suspect
-			}
+	if inc < m.Incarnation {
+		return
+	}
+	m.Incarnation = inc
 
-		case EvDead:
-			if m.State != Dead {
-				log.Printf("[SWIM] %s → DEAD (inc=%d)", addr, inc)
-			}
-			m.State = Dead
-			// notifica registry solo quando lo stato diventa veramente DEAD
+	switch kind {
+	case EvAlive:
+		if m.State == Dead {
+			log.Printf("[SWIM] %s resurrected → ALIVE (inc=%d)", addr, inc)
+			go notifyRegistryAlive(addr)
+		}
+		m.State = Alive
+		m.LastAck = time.Now()
+
+	case EvSuspect:
+		if m.State == Alive {
+			log.Printf("[SWIM] %s → SUSPECT (inc=%d)", addr, inc)
+			m.State = Suspect
+		}
+
+	case EvDead:
+		if m.State != Dead {
+			log.Printf("[SWIM] %s → DEAD (inc=%d)", addr, inc)
 			go notifyRegistryDead(addr)
 		}
+		m.State = Dead
 	}
 }
 
@@ -222,7 +215,7 @@ func sendPiggyback(conn net.Conn) {
 		fmt.Fprintf(conn, "%s %s %d\n", e.Kind, e.Addr, e.Incarnation)
 		e.HopsLeft--
 		if e.HopsLeft > 0 {
-			nextQ = append(nextQ, e) // rimetti in coda se deve ancora girare
+			nextQ = append(nextQ, e)
 		}
 	}
 	eventQ = nextQ
@@ -230,45 +223,32 @@ func sendPiggyback(conn net.Conn) {
 }
 
 // -------------------------------------------------------------
-// 4.  Periodic prober
+// 4.  Periodic prober + reaper
 // -------------------------------------------------------------
-
-// swim.go
+const (
+	probePeriod    = 5 * time.Second
+	probeTimeout   = 500 * time.Millisecond
+	kIndirect      = 3
+	dumpInterval   = 10 * time.Second
+	suspectTimeout = 15 * time.Second
+)
 
 func StartSWIM(myAddr string, initialPeers []string, reg string) {
-	// salva registry e indirizzo self
 	registryAddr = reg
 	selfAddr = myAddr
-
-	// seed per le scelte random
 	rand.Seed(time.Now().UnixNano())
 
-	// 1) inizializza la membership locale (+ self)
 	addInitialPeers(myAddr, initialPeers)
+	enqueue(Event{Kind: EvJoin, Addr: myAddr, Incarnation: 0, HopsLeft: gossipTTL})
 
-	// 2) metti in coda il JOIN di questo nodo per farlo gossipare
-	evMu.Lock()
-	eventQ = append(eventQ, Event{
-		Kind:        EvJoin,
-		Addr:        myAddr,
-		Incarnation: 0,
-		HopsLeft:    gossipTTL,
-	})
-	evMu.Unlock()
-
-	// 3) avvia il prober e il dump di debug
+	go antiEntropyLoop()
 	go probeLoop(myAddr)
+	go reaperLoop()
+	go handleGracefulLeave()
 	if dumpInterval > 0 {
 		go dumpMembership()
 	}
 }
-
-const (
-	probePeriod  = 5 * time.Second
-	probeTimeout = 500 * time.Millisecond
-	kIndirect    = 3
-	dumpInterval = 10 * time.Second
-)
 
 func probeLoop(me string) {
 	ticker := time.NewTicker(probePeriod)
@@ -278,15 +258,16 @@ func probeLoop(me string) {
 			continue
 		}
 		log.Printf("[SWIM] probe → %s", target)
+
 		if !directPing(target, me) {
 			markSuspect(target)
 
 			helpers := chooseKRandomExcept([]string{me, target}, kIndirect)
-			gotAck := make(chan bool, 1)
+			gotAck := make(chan struct{}, 1)
 			for _, h := range helpers {
 				go func(proxy string) {
 					if indirectPing(proxy, target, me) {
-						gotAck <- true
+						gotAck <- struct{}{}
 					}
 				}(h)
 			}
@@ -302,6 +283,28 @@ func probeLoop(me string) {
 	}
 }
 
+func reaperLoop() {
+	t := time.NewTicker(suspectTimeout / 2)
+	for range t.C {
+		now := time.Now()
+		memMu.Lock()
+		for _, m := range members {
+			if m.Addr == selfAddr { // NEW
+				continue // mai toccare se stessi
+			}
+			if m.State == Suspect && now.Sub(m.LastAck) > suspectTimeout {
+				markDead(m.Addr)
+			}
+		}
+		memMu.Unlock()
+	}
+}
+
+// swim.go  (patch sintetico)
+
+// 1.  logSnapshot: forza la stampa anche se identico
+var lastSnap string
+
 func dumpMembership() {
 	t := time.NewTicker(dumpInterval)
 	for range t.C {
@@ -314,11 +317,19 @@ func dumpMembership() {
 			snap = append(snap, fmt.Sprintf("%s:%s(i=%d)", addr, m.State, m.Incarnation))
 		}
 		memMu.Unlock()
-		log.Printf("[SWIM] membership snapshot (sans self): %v", snap)
+
+		cur := strings.Join(snap, " ")
+		if cur != lastSnap {
+			log.Printf("[SWIM] membership snapshot: [%s]", cur)
+			lastSnap = cur
+		}
 	}
 }
 
 func markSuspect(addr string) {
+	if addr == selfAddr {
+		return
+	}
 	memMu.Lock()
 	if m, ok := members[addr]; ok && m.State == Alive {
 		m.State = Suspect
@@ -330,6 +341,9 @@ func markSuspect(addr string) {
 }
 
 func markDead(addr string) {
+	if addr == selfAddr {
+		return
+	}
 	memMu.Lock()
 	if m, ok := members[addr]; ok && m.State != Dead {
 		m.State = Dead
@@ -337,15 +351,46 @@ func markDead(addr string) {
 		enqueue(Event{Kind: EvDead, Addr: addr, Incarnation: m.Incarnation, HopsLeft: gossipTTL})
 		log.Printf("[SWIM] mark DEAD %s (inc=%d)", addr, m.Incarnation)
 		go notifyRegistryDead(addr)
+		//------GOSSIP IMMEDIATO---------
+		go gossipNow() //fan out immediato ai peer ALIVE
 	}
 	memMu.Unlock()
+}
+
+func gossipNow() {
+	peers := alivePeers()
+	for _, p := range peers {
+		go func(dest string) {
+			conn, err := net.DialTimeout("tcp", dest, probeTimeout)
+			if err != nil {
+				return
+			}
+			sendPiggyback(conn)
+			_ = conn.Close()
+		}(p)
+	}
+}
+
+func alivePeers() []string {
+	memMu.Lock()
+	defer memMu.Unlock()
+	var list []string
+	for addr, m := range members {
+		if addr != selfAddr && m.State == Alive {
+			list = append(list, addr)
+		}
+	}
+	return list
 }
 
 // -------------------------------------------------------------
 // 5.  I/O helpers
 // -------------------------------------------------------------
-
 func directPing(target, me string) bool {
+	wait := make(chan struct{})
+	ackWaiters.Store(target, wait)
+	defer ackWaiters.Delete(target)
+
 	conn, err := net.DialTimeout("tcp", target, probeTimeout)
 	if err != nil {
 		log.Printf("[SWIM] dial %s: %v", target, err)
@@ -355,47 +400,42 @@ func directPing(target, me string) bool {
 	sendPiggyback(conn)
 	_ = conn.Close()
 
-	timeout := time.After(probeTimeout)
-	for {
-		select {
-		case a := <-ackCh:
-			if a == target {
-				return true
-			}
-		case <-timeout:
-			return false
-		}
+	select {
+	case <-wait:
+		return true
+	case <-time.After(probeTimeout):
+		return false
 	}
 }
 
 func indirectPing(proxy, target, origin string) bool {
+	// Prepara il waiter per il target
+	wait := make(chan struct{})
+	ackWaiters.Store(target, wait)
+	defer ackWaiters.Delete(target)
+
+	// Invia PING-REQ al proxy
 	conn, err := net.DialTimeout("tcp", proxy, probeTimeout)
 	if err != nil {
 		log.Printf("[SWIM] dial proxy %s: %v", proxy, err)
 		return false
 	}
-	defer conn.Close()
-
 	fmt.Fprintf(conn, "PING-REQ %s %s\n", target, origin)
 	sendPiggyback(conn)
+	_ = conn.Close()
 
-	timeout := time.After(probeTimeout)
-	for {
-		select {
-		case a := <-ackCh:
-			if a == target {
-				return true
-			}
-		case <-timeout:
-			return false
-		}
+	// Attendi l’ACK o il timeout
+	select {
+	case <-wait:
+		return true
+	case <-time.After(probeTimeout):
+		return false
 	}
 }
 
 // -------------------------------------------------------------
 // 6.  Random helpers
 // -------------------------------------------------------------
-
 func pickRandomPeer(me string) string {
 	memMu.Lock()
 	defer memMu.Unlock()
@@ -422,9 +462,13 @@ func chooseKRandomExcept(exclude []string, k int) []string {
 
 	var pool []string
 	for addr, m := range members {
-		if _, skip := ex[addr]; !skip && m.State == Alive {
-			pool = append(pool, addr)
+		if _, skip := ex[addr]; skip {
+			continue
 		}
+		if m.State != Alive {
+			continue
+		} // <-- salta SUSPECT/DEAD
+		pool = append(pool, addr)
 	}
 
 	rand.Shuffle(len(pool), func(i, j int) { pool[i], pool[j] = pool[j], pool[i] })
@@ -435,9 +479,8 @@ func chooseKRandomExcept(exclude []string, k int) []string {
 }
 
 // -------------------------------------------------------------
-// 7.  Frame parser
+// 7.  Frame parser (per piggy-back & comandi interni)
 // -------------------------------------------------------------
-
 func HandleSWIM(frame string) {
 	parts := strings.Fields(strings.TrimSpace(frame))
 	if len(parts) < 2 {
@@ -447,65 +490,28 @@ func HandleSWIM(frame string) {
 
 	switch kind {
 	case "JOIN":
-		// 1) costruisci l’evento JOIN con TTL
-		e := Event{
-			Kind:        EvJoin,
-			Addr:        addr,
-			Incarnation: 0,
-			HopsLeft:    gossipTTL,
-		}
-		// 2) deduplica
-		if alreadySeen(e) {
-			return
-		}
-		// 3) applica localmente
-		memMu.Lock()
-		if addr != selfAddr {
-			members[addr] = &Member{
-				Addr:        addr,
-				State:       Alive,
-				Incarnation: 0,
-				LastAck:     time.Now(),
-			}
-		}
-		memMu.Unlock()
-		log.Printf("[SWIM] %s → JOINED (inc=0)", addr)
-		// 4) re-inserisci in eventQ per il gossip
-		enqueue(e)
+		updateFromRemote(EvJoin, addr, 0)
 
 	case "ALIVE", "SUSPECT", "DEAD":
 		inc := 0
 		if len(parts) == 3 {
 			fmt.Sscanf(parts[2], "%d", &inc)
 		}
-		eType := map[string]EventType{"ALIVE": EvAlive, "SUSPECT": EvSuspect, "DEAD": EvDead}[kind]
-		e := Event{Kind: eType, Addr: addr, Incarnation: uint64(inc), HopsLeft: gossipTTL}
-		if alreadySeen(e) {
-			return
-		}
-		// 1) aggiorna stato locale
 		updateMember(addr, kind, inc)
-		// 2) rimetti in coda per far girare il gossip altri TTL hop
-		enqueue(e)
-
-		// non dovrebbe più arrivarci: ormai il PING è gestito in handleConn.
-		// lasciamo il case vuoto per sicurezza.
-	case "PING":
-		return
 
 	case "ACK":
-		// len(parts) == 2 già garantito dal chiamante
-		select {
-		case ackCh <- addr: // addr = parts[1]
-		default: // canale pieno? pazienza, ignora
+		// idem: rimuove il waiter e chiude il canale solo una volta
+		if chAny, ok := ackWaiters.LoadAndDelete(addr); ok {
+			close(chAny.(chan struct{}))
 		}
+		recordAck(addr)
+
 	}
 }
 
 // -------------------------------------------------------------
 // 8.  Registry notifiers
 // -------------------------------------------------------------
-
 func notifyRegistryAlive(addr string) {
 	conn, err := net.DialTimeout("tcp", registryAddr, 2*time.Second)
 	if err != nil {
@@ -527,21 +533,52 @@ func notifyRegistryDead(victim string) {
 }
 
 // -------------------------------------------------------------
-// (nuovo)  Deduplica delle notizie viste
+// 9.  Deduplica notizie viste
 // -------------------------------------------------------------
-
-// chiave: kind|addr  →  ultima incarnation gossippata
-var seenMu sync.Mutex
-var seen = map[string]uint64{}
 
 func alreadySeen(e Event) bool {
 	k := fmt.Sprintf("%d|%s", e.Kind, e.Addr)
 	seenMu.Lock()
 	defer seenMu.Unlock()
-	if e.Incarnation <= seen[k] {
-		return true // duplicato
+	old, exists := seen[k]
+	if exists && e.Incarnation <= old {
+		return true
 	}
-	// non visto (o incarnation più nuova): lo segniamo
 	seen[k] = e.Incarnation
 	return false
+}
+
+func antiEntropyLoop() {
+	ticker := time.NewTicker(10 * time.Second)
+	for range ticker.C {
+		memMu.Lock()
+		peers := make([]string, 0, len(members))
+		for addr, m := range members {
+			if addr != selfAddr && m.State == Alive {
+				peers = append(peers, addr)
+			}
+		}
+		memMu.Unlock()
+		for _, p := range peers {
+			go func(dest string) {
+				conn, err := net.DialTimeout("tcp", dest, probeTimeout)
+				if err != nil {
+					return
+				}
+				sendPiggyback(conn)
+				_ = conn.Close()
+			}(p)
+		}
+	}
+}
+
+func handleGracefulLeave() {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
+	<-c
+	// 1) gossip di DEAD per noi stessi
+	markDead(selfAddr)
+	// 2) notifiche registry
+	go notifyRegistryDead(selfAddr)
+	os.Exit(0)
 }

@@ -12,9 +12,9 @@ import (
 
 /*
    swim.go espone:
-     StartSWIM(myAddr string, registryAddr string)
-     addInitialPeers(myAddr string, peers []string)
-     HandleSWIM(msg string)
+     StartSWIM(...)
+     addInitialPeers(...)
+     HandleSWIM(...)
 */
 
 // -------------------------------------------------------------------
@@ -78,59 +78,67 @@ func handleConn(c net.Conn) {
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-
 		parts := strings.Fields(line)
+		if len(parts) == 0 {
+			continue
+		}
+
 		switch parts[0] {
-		case "PING":
-			// formato: PING <originAddr>
-			if len(parts) == 2 {
-				origin := parts[1]
-
-				// 1) il mittente è vivo
-				HandleSWIM(fmt.Sprintf("ALIVE %s 0", origin))
-
-				// 2) rispondiamo **con una connessione nuova**, non su 'c'
-				go func() {
-					// l’ACK deve contenere l’indirizzo del bersaglio del ping,
-					// cioè il nostro (selfAddr).
-					sendFrame(origin, "ACK %s\n", selfAddr)
-				}()
-
-				// 3) piggy-back (eventi nostri) sulla stessa connessione entrante
-				//    finché è aperta – opzionale ma comodo.
-				sendPiggyback(c)
+		case "PING": // PING <origin>
+			if len(parts) != 2 {
+				continue
 			}
+			origin := parts[1]
 
-		case "ACK":
-			// formato: ACK <who>
-			if len(parts) == 2 {
-				addr := parts[1]
-				HandleSWIM(fmt.Sprintf("ACK %s", addr)) // mette su ackCh
-				// nessun bisogno di piggy-back qui
-			}
+			HandleSWIM(fmt.Sprintf("ALIVE %s 0", origin)) // mittente è vivo
 
-		case "PING-REQ":
-			// formato: PING-REQ <target> <origin>
-			if len(parts) == 3 {
-				target, origin := parts[1], parts[2]
+			// Rispondiamo con ACK su nuova connessione
+			go sendFrame(origin, "ACK %s\n", selfAddr)
 
-				// lanciamo un ping diretto al bersaglio
-				go func() {
-					if directPing(target, origin) {
-						// se riceviamo l’ACK dal target, giriamo un ACK all’origin
-						sendFrame(origin, "ACK %s\n", target)
-					}
-				}()
-				// niente risposta immediata al proxy-caller
-			}
-
-		case "JOIN":
-			addr := parts[1]
-			updateFromRemote(EvJoin, addr, 0)
+			// Piggy-back dei nostri eventi sulla conn. entrante
 			sendPiggyback(c)
 
+		case "ACK": // ACK <who>
+			if len(parts) != 2 {
+				continue
+			}
+			addr := parts[1]
+
+			// chiudiamo e cancelliamo il waiter in un solo colpo
+			if chAny, ok := ackWaiters.LoadAndDelete(addr); ok {
+				close(chAny.(chan struct{}))
+			}
+			recordAck(addr)
+
+		case "PING-REQ": // PING-REQ <target> <origin>
+			if len(parts) != 3 {
+				continue
+			}
+			target, origin := parts[1], parts[2]
+			go func() {
+				if directPing(target, origin) {
+					sendFrame(origin, "ACK %s\n", target)
+				}
+			}()
+
+		case "JOIN":
+			if len(parts) != 2 {
+				continue
+			}
+			updateFromRemote(EvJoin, parts[1], 0)
+			sendPiggyback(c)
+
+		case "REMOVE":
+			if len(parts) != 2 {
+				continue
+			}
+			target := parts[1]
+			memMu.Lock()
+			delete(members, target)
+			memMu.Unlock()
+			log.Printf("[SWIM] Removed from %s", target)
+
 		default:
-			// tutte le altre righe (EVT piggyback o comandi custom)
 			HandleSWIM(line)
 			sendPiggyback(c)
 		}
