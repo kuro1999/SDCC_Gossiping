@@ -95,4 +95,3 @@ services:
     entrypoint:
       - /orchestrator.sh
     restart: "no"
-
