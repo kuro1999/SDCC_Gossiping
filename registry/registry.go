@@ -234,5 +234,4 @@ func main() {
 		}
 		go handleConn(conn)
 	}
-	select {}
 }
