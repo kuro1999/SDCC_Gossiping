@@ -7,41 +7,17 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
-/*
-   swim.go espone:
-     StartSWIM(...)
-     addInitialPeers(...)
-     HandleSWIM(...)
-*/
+var (
+	// udpConn è il listener/gateway UDP per gossip e failure detector
+	udpConnection *net.UDPConn
 
-// -------------------------------------------------------------------
-// utilità di rete
-// -------------------------------------------------------------------
-func sendFrame(dest, format string, a ...any) {
-	conn, err := net.DialTimeout("tcp", dest, 2*time.Second)
-	if err != nil {
-		log.Printf("[NET] dial %s failed: %v", dest, err)
-		return
-	}
-	fmt.Fprintf(conn, format, a...)
-	_ = conn.Close()
-}
-
-// -------------------------------------------------------------------
-// broadcast JOIN
-// -------------------------------------------------------------------
-func broadcastJoin(myAddr string, peers []string) {
-	for _, p := range peers {
-		if p == myAddr {
-			continue
-		}
-		go sendFrame(p, "JOIN %s\n", myAddr)
-		log.Printf("[JOIN] sent JOIN to %s", p)
-	}
-}
+	// ackWaiters tiene i canali su cui bloccare il ping
+	ackWaiters sync.Map // mappa[string]chan struct{}
+)
 
 // -------------------------------------------------------------------
 // bootstrap dal registry
@@ -68,99 +44,18 @@ func getPeers(registryAddr, myID, myAddr string) []string {
 	}
 }
 
-// -------------------------------------------------------------------
-// listener TCP
-// -------------------------------------------------------------------
-func handleConn(c net.Conn) {
-	defer c.Close()
-	scanner := bufio.NewScanner(c)
-	remote := c.RemoteAddr().String()
+func addInitialPeers(myAddr string, peers []string) {
+	memMu.Lock()
+	defer memMu.Unlock()
 
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		parts := strings.Fields(line)
-		if len(parts) == 0 {
+	members[myAddr] = &Member{Addr: myAddr, State: Alive, Incarnation: 0, LastAck: time.Now()}
+	for _, p := range peers {
+		if p == myAddr {
 			continue
 		}
-
-		switch parts[0] {
-		case "PING": // PING <origin>
-			if len(parts) != 2 {
-				continue
-			}
-			origin := parts[1]
-
-			HandleSWIM(fmt.Sprintf("ALIVE %s 0", origin)) // mittente è vivo
-
-			// Rispondiamo con ACK su nuova connessione
-			go sendFrame(origin, "ACK %s\n", selfAddr)
-
-			// Piggy-back dei nostri eventi sulla conn. entrante
-			sendPiggyback(c)
-
-		case "ACK": // ACK <who>
-			if len(parts) != 2 {
-				continue
-			}
-			addr := parts[1]
-			if chAny, ok := ackWaiters.LoadAndDelete(addr); ok {
-				close(chAny.(chan struct{}))
-			}
-			recordAck(addr)
-
-		case "PING-REQ": // PING-REQ <target> <origin>
-			if len(parts) != 3 {
-				continue
-			}
-			target, origin := parts[1], parts[2]
-			go func() {
-				if directPing(target, origin) {
-					sendFrame(origin, "ACK %s\n", target)
-				}
-			}()
-
-		case "JOIN":
-			if len(parts) != 2 {
-				continue
-			}
-			updateFromRemote(EvJoin, parts[1], 0)
-			sendPiggyback(c)
-
-		case "REMOVE":
-			if len(parts) != 2 {
-				continue
-			}
-			target := parts[1]
-			memMu.Lock()
-			delete(members, target)
-			memMu.Unlock()
-			log.Printf("[SWIM] Removed from %s", target)
-
-		case "LEAVE":
-			if len(parts) < 2 {
-				continue
-			}
-			victim := parts[1]
-			if victim == selfAddr {
-				// voluntary leave indirizzato a me → faccio l’uscita ordinata
-				gracefulLeave()
-			} else {
-				// leave di un altro peer: lo rimuovo dalla mia membership
-				memMu.Lock()
-				delete(members, victim)
-				memMu.Unlock()
-				log.Printf("[SWIM] %s voluntarily left", victim)
-			}
-
-		default:
-			HandleSWIM(line)
-			sendPiggyback(c)
-		}
+		members[p] = &Member{Addr: p, State: Alive, Incarnation: 0, LastAck: time.Now()}
 	}
-
-	if err := scanner.Err(); err != nil {
-		log.Printf("[NET] scanner error from %s: %v", remote, err)
-	}
+	log.Printf("[BOOT] initial membership: %v", peers)
 }
 
 // -------------------------------------------------------------------
@@ -173,46 +68,74 @@ func main() {
 	}
 	myID := os.Args[1]
 	myAddr := os.Args[2]
-	registryAddr := os.Args[3]
+	selfAddr = myAddr
+	registryAddr = os.Args[3]
 
 	log.SetFlags(0)
 	log.SetPrefix(fmt.Sprintf("[%s] ", myID))
 	log.Printf("[BOOT] starting node %s  (%s)", myID, myAddr)
 
-	// 1) snapshot iniziale
+	// --- 1) apri il listener UDP per gossip + ping/ack ---
+	udpAddr, err := net.ResolveUDPAddr("udp", myAddr)
+	if err != nil {
+		log.Fatalf("[BOOT] invalid UDP addr %q: %v", myAddr, err)
+	}
+	conn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		log.Fatalf("[BOOT] cannot listen UDP on %q: %v", myAddr, err)
+	}
+	udpConnection = conn
+	log.Printf("[BOOT] gossip+ping listener on UDP %s", myAddr)
+	go listenGossipUDP(udpConnection)
+
+	// --- 2) bootstrap dal registry (TCP) ---
 	initial := getPeers(registryAddr, myID, myAddr)
 
-	// 2) membership locale
+	// --- 3) inizializza view locale e JOIN gossip ---
 	addInitialPeers(myAddr, initial)
+	// node.go  (nel main, dopo addInitialPeers)
+	if wasAlreadyMember() { // usa un flag su disco o nel registry
+		// ↑ persistenza semplice: file .inc
+		var selfInc uint64
+		for addr, m := range members {
+			if addr == selfAddr {
+				selfInc = m.Incarnation
+			}
+		}
+		// enqueue ALIVE con nuova incarnation
+		evMu.Lock()
+		selfInc++
+		eventQ = append(eventQ, Event{
+			Kind: EvAlive, Addr: myAddr,
+			Incarnation: selfInc, HopsLeft: getHops(),
+		})
+		evMu.Unlock()
 
-	// 3) JOIN gossip
-	if len(initial) > 0 {
-		broadcastJoin(myAddr, initial)
+		go notifyRegistryAlive(myAddr) // TCP: "ALIVE <addr>\n"
+		go gossipNowUDP()
+	} else if len(initial) > 0 {
+		diffuseJoin(myAddr) // primo avvio reale
 	}
 
-	// 4) me stesso ALIVE inc=0
-	HandleSWIM(fmt.Sprintf("ALIVE %s 0", myAddr))
+	// --- 5) avvio manuale dei loop SWIM → tutti via UDP ---
+	go probeLoopUDP()                       // ping periodici + indirect → Suspect/Dead
+	go reaperLoop()                         // promozione da Suspect a Dead
+	go antiEntropyLoopUDP(10 * time.Second) // push periodico di tutta la eventQ
+	go dumpMembership()                     // log snapshot (opzionale)
 
-	// 5) listener
-	port := strings.Split(myAddr, ":")[1]
+	port := strings.Split(selfAddr, ":")[1]
 	ln, err := net.Listen("tcp", ":"+port)
 	if err != nil {
-		log.Fatalf("[BOOT] listen %s failed: %v", myAddr, err)
+		log.Fatalf("TCP listen failed: %v", err)
 	}
-	log.Printf("[BOOT] listening on %s", myAddr)
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				log.Printf("[NET] accept failed: %v", err)
-				continue
-			}
-			go handleConn(c)
+	log.Printf("TCP listener on %s", selfAddr)
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Printf("accept failed: %v", err)
+			continue
 		}
-	}()
-
-	// 6) failure detector
-	StartSWIM(myAddr, initial, registryAddr)
-
-	select {} // blocca
+		go handleConn(conn)
+	}
+	select {}
 }
