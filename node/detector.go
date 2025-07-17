@@ -87,69 +87,98 @@ type Event struct {
 	HopsLeft    int
 }
 
+// -----------------------------------------------------------------
+// updateFromRemote: applica un evento ricevuto da gossip/SWIM.
+// Ordine:
+//  0. calcola hops fuori lock
+//  1. crea l’entry se mancante (solo JOIN/ALIVE)
+//  2. deduplica; se già visto & non ALIVE => esce
+//  3. enqueue per piggy-back
+//  4. transizioni di stato + side-effects
+//
+// -----------------------------------------------------------------
 func updateFromRemote(kind EventType, addr string, inc uint64) {
-	e := Event{Kind: kind, Addr: addr, Incarnation: inc, HopsLeft: getHops()}
+	// 0) calcolo hops fuori dal lock
+	hops := getHops()
+	evt := Event{Kind: kind, Addr: addr, Incarnation: inc, HopsLeft: hops}
 
-	hopsleft := getHops()
-	// deduplica: solo ALIVE viaggia sempre
-	if alreadySeen(e) && kind != EvAlive {
-		return
-	}
-	enqueue(e)
-
-	memMu.Lock()
-	defer memMu.Unlock()
-
-	// -----------------------------------------------------------------
-	// 1) SELF-DEFENCE (se qualcuno ci dà per morti / sospetti / leave)
-	// -----------------------------------------------------------------
+	// --- 1) self-defence: se qualcuno ci marca SUSPECT/DEAD, resuscitiamo subito ---
 	if addr == selfAddr && kind != EvAlive {
+		// bump incarnation sotto lock
+		memMu.Lock()
 		self := members[selfAddr]
 		self.Incarnation++
 		self.State = Alive
 		self.LastAck = time.Now()
-		enqueue(Event{Kind: EvAlive, Addr: selfAddr, Incarnation: self.Incarnation, HopsLeft: hopsleft})
-		log.Printf("[SWIM] self-defence → ALIVE (inc=%d)", self.Incarnation)
+		newInc := self.Incarnation
+		memMu.Unlock()
+
+		// enqueue e broadcast del nuovo ALIVE
+		enqueue(Event{Kind: EvAlive, Addr: selfAddr, Incarnation: newInc, HopsLeft: hops})
+		log.Printf("[SWIM] self-defence → ALIVE (inc=%d)", newInc)
+
 		go notifyRegistryAlive(selfAddr)
 		go gossipNowUDP()
 		return
 	}
 
-	// -----------------------------------------------------------------
-	// 2) se non esiste l’entry, creala solo per ALIVE o JOIN
-	// -----------------------------------------------------------------
+	// --- 2) assicuro l’entry per JOIN/ALIVE remoti ---
+	memMu.Lock()
 	m, ok := members[addr]
 	if !ok && (kind == EvAlive || kind == EvJoin) {
 		m = &Member{Addr: addr}
 		members[addr] = m
-	} else if !ok { // ignoriamo SUSPECT / DEAD / LEAVE di ignoti
+	}
+	memMu.Unlock()
+
+	// --- 3) deduplica (ALIVE viaggia sempre) ---
+	if alreadySeen(evt) && kind != EvAlive {
 		return
 	}
 
-	// -----------------------------------------------------------------
-	// 3) transizioni di stato
-	// -----------------------------------------------------------------
+	// --- 4) metto in coda l’evento vero e proprio ---
+	enqueue(evt)
+
+	// --- 5) transizioni di stato sotto lock ---
+	memMu.Lock()
+	defer memMu.Unlock()
+
+	// se non esiste la entry (es. SUSPECT/DEAD/LEAVE di ignoti), esco
+	m, ok = members[addr]
+	if !ok {
+		return
+	}
+
 	switch kind {
 	case EvJoin:
 		if inc >= m.Incarnation {
+			changed := inc > m.Incarnation || m.State != Alive
 			*m = Member{Addr: addr, State: Alive, Incarnation: inc, LastAck: time.Now()}
-			log.Printf("[SWIM] %s → JOINED (inc=%d)", addr, inc)
-			go notifyRegistryAlive(addr)
-			go gossipNowUDP()
+			if changed {
+				log.Printf("[SWIM] %s → JOINED (inc=%d)", addr, inc)
+				go notifyRegistryAlive(addr)
+				go gossipNowUDP()
+			}
 		}
 
 	case EvAlive:
 		if inc < m.Incarnation {
 			return
 		}
-		if m.State == Dead {
-			log.Printf("[SWIM] %s resurrected → ALIVE (inc=%d)", addr, inc)
-			go notifyRegistryAlive(addr)
+		changed := inc > m.Incarnation || m.State != Alive
+		if changed {
+			if m.State == Dead {
+				log.Printf("[SWIM] %s resurrected → ALIVE (inc=%d)", addr, inc)
+				go notifyRegistryAlive(addr)
+			}
+			m.State = Alive
+			m.Incarnation = inc
+			m.LastAck = time.Now()
 			go gossipNowUDP()
+		} else {
+			// semplice refresh di LastAck
+			m.LastAck = time.Now()
 		}
-		m.State = Alive
-		m.Incarnation = inc
-		m.LastAck = time.Now()
 
 	case EvSuspect:
 		if inc < m.Incarnation || m.State != Alive {
@@ -170,13 +199,13 @@ func updateFromRemote(kind EventType, addr string, inc uint64) {
 		go gossipNowUDP()
 
 	case EvLeave:
-		// rimuoviamo subito il nodo dalla membership
 		delete(members, addr)
 		log.Printf("[SWIM] %s → voluntarily LEFT", addr)
 		go notifyRegistryLeave(addr)
 		go gossipNowUDP()
 	}
 }
+
 func wasAlreadyMember() bool {
 	var savedIncarnation uint64
 	for addr, m := range members {
@@ -272,6 +301,7 @@ func notifyRegistryAlive(addr string) {
 	}
 	fmt.Fprintf(conn, "ALIVE %s\n", addr)
 	_ = conn.Close()
+	log.Printf("[SWIM] notificato registry: ALIVE %s", addr)
 }
 
 func notifyRegistryDead(victim string) {
@@ -297,36 +327,21 @@ func notifyRegistryLeave(addr string) {
 // 9.  Deduplica notizie viste
 // -------------------------------------------------------------
 
-func alreadySeen(e Event) bool {
-	k := fmt.Sprintf("%d|%s", e.Kind, e.Addr)
-	seenMu.Lock()
-	defer seenMu.Unlock()
-	old, exists := seen[k]
-	if exists && e.Incarnation <= old {
-		return true
-	}
-	seen[k] = e.Incarnation
-	return false
-}
-
 func handleConn(c net.Conn) {
 	defer c.Close()
 	scanner := bufio.NewScanner(c)
 
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		parts := strings.Fields(line)
+		parts := strings.Fields(strings.TrimSpace(scanner.Text()))
 		if len(parts) == 0 {
 			continue
 		}
-
 		switch parts[0] {
-
-		// … gli altri casi PING, ACK, JOIN, LEAVE, ecc. …
-
-		case "REMOVE": // Registry dice: “Elimina questo peer dalla tua view”
+		case "REMOVE":
+			hops := getHops()
 			if len(parts) != 2 {
-				continue
+				log.Printf("[SWIM] malformed REMOVE, closing")
+				return
 			}
 			victim := parts[1]
 
@@ -335,26 +350,28 @@ func handleConn(c net.Conn) {
 			if _, ok := members[victim]; ok {
 				delete(members, victim)
 				log.Printf("[SWIM] %s removed by registry", victim)
-
-				// 2) (opzionale) se vuoi far girare il leave via gossip interno:
-				evMu.Lock()
-				eventQ = append(eventQ, Event{
-					Kind:        EvLeave,
-					Addr:        victim,
-					Incarnation: 0,
-					HopsLeft:    getHops(),
-				})
-				evMu.Unlock()
-				go gossipNowUDP()
 			}
 			memMu.Unlock()
 
+			// 2) Enqueue di un LEAVE per gossip UDP
+			evMu.Lock()
+			eventQ = append(eventQ, Event{
+				Kind:        EvLeave,
+				Addr:        victim,
+				Incarnation: 0,
+				HopsLeft:    hops,
+			})
+			evMu.Unlock()
+			go gossipNowUDP()
+
+			// 3) chiudo subito l’handler
+			return
+
 		default:
-			// … eventuale fallback per piggyback e comandi extra …
+			continue
 		}
 	}
-
 	if err := scanner.Err(); err != nil {
-		log.Printf("[NET] scanner error from %s: %v", c.RemoteAddr(), err)
+		log.Printf("[NET] scanner error: %v", err)
 	}
 }

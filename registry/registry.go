@@ -16,7 +16,7 @@ func init() { log.SetFlags(0) }
 
 // grace period before final removal after quorum DEAD
 var (
-	gracePeriod     = 20 * time.Second
+	gracePeriod     = 10 * time.Second
 	pendingRemovals = make(map[string]*time.Timer)
 )
 
@@ -34,7 +34,6 @@ var (
 )
 
 // durata del grace period in secondi
-const gracePeriodSec = 20
 
 // ------------------------------------------------------------------
 // utilità
@@ -134,8 +133,13 @@ func handleConn(conn net.Conn) {
 
 		reportCnt := len(reports[victim])
 		total := len(peers)
-		quorum := int(math.Floor(0.5*float64(total))) + 1
 
+		quorum := int(math.Floor(0.5*float64(total))) + 1
+		if total == 2 {
+			quorum = 1
+		} else if total == 1 {
+			quorum = 0
+		}
 		// 1) LOG dei singoli report SOLO se non abbiamo già schedulato la removal
 		if _, scheduled := pendingRemovals[victim]; !scheduled {
 			log.Printf(
@@ -149,7 +153,7 @@ func handleConn(conn net.Conn) {
 			if _, exists := pendingRemovals[victim]; !exists {
 				log.Printf(
 					"[REGISTRY] scheduled removal of %s(%s) in %ds",
-					victimID, victim, gracePeriodSec,
+					victimID, victim, gracePeriod,
 				)
 				pendingRemovals[victim] = time.AfterFunc(gracePeriod, func() {
 					peersMu.Lock()

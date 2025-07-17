@@ -17,6 +17,9 @@ var (
 
 	// ackWaiters tiene i canali su cui bloccare il ping
 	ackWaiters sync.Map // mappa[string]chan struct{}
+
+	resurrectNotified   = make(map[string]uint64) // addr → incarnation per cui ho già notificato
+	resurrectNotifiedMu sync.Mutex
 )
 
 // -------------------------------------------------------------------
@@ -44,18 +47,42 @@ func getPeers(registryAddr, myID, myAddr string) []string {
 	}
 }
 
-func addInitialPeers(myAddr string, peers []string) {
+// helper: restituisce tutte le chiavi di members
+func memberAddrs() []string {
 	memMu.Lock()
 	defer memMu.Unlock()
+	addrs := make([]string, 0, len(members))
+	for addr := range members {
+		addrs = append(addrs, addr)
+	}
+	return addrs
+}
 
-	members[myAddr] = &Member{Addr: myAddr, State: Alive, Incarnation: 0, LastAck: time.Now()}
+func addInitialPeers(myAddr string, peers []string) {
+	memMu.Lock()
+	// 1) aggiungo sempre me stesso
+	members[myAddr] = &Member{
+		Addr:        myAddr,
+		State:       Alive,
+		Incarnation: 0,
+		LastAck:     time.Now(),
+	}
+	// 2) aggiungo gli altri peer
 	for _, p := range peers {
 		if p == myAddr {
 			continue
 		}
-		members[p] = &Member{Addr: p, State: Alive, Incarnation: 0, LastAck: time.Now()}
+		members[p] = &Member{
+			Addr:        p,
+			State:       Alive,
+			Incarnation: 0,
+			LastAck:     time.Now(),
+		}
 	}
-	log.Printf("[BOOT] initial membership: %v", peers)
+	memMu.Unlock()
+
+	// 3) loggiamo lo stato reale della membership
+	log.Printf("[BOOT] initial membership: %v", memberAddrs())
 }
 
 // -------------------------------------------------------------------
@@ -93,6 +120,7 @@ func main() {
 
 	// --- 3) inizializza view locale e JOIN gossip ---
 	addInitialPeers(myAddr, initial)
+	log.Printf("[BOOT] init incarnation=%d", members[selfAddr].Incarnation)
 	// node.go  (nel main, dopo addInitialPeers)
 	if wasAlreadyMember() { // usa un flag su disco o nel registry
 		// ↑ persistenza semplice: file .inc
@@ -129,13 +157,19 @@ func main() {
 		log.Fatalf("TCP listen failed: %v", err)
 	}
 	log.Printf("TCP listener on %s", selfAddr)
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			log.Printf("accept failed: %v", err)
-			continue
+
+	// Avvio il loop di Accept in una goroutine
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				log.Printf("accept failed: %v", err)
+				continue
+			}
+			go handleConn(conn)
 		}
-		go handleConn(conn)
-	}
+	}()
+
+	// Tengo vivo il main, così tutte le goroutine (listener UDP, probeLoop, ecc.) restano attive.
 	select {}
 }

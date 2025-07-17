@@ -17,13 +17,18 @@ docker unpause node2
 echo "[ORCH] Done pause/unpause cycle."
 
 # 2) voluntary‐leave: lo faccio partire via TCP, non con i segnali
-echo "[ORCH] Will send voluntary LEAVE to ${TARGET} in ${LEAVE_AFTER}s"
+echo "[ORCH] Will send voluntary LEAVE to node3 in ${LEAVE_AFTER}s"
 sleep "${LEAVE_AFTER}"
 
-echo "[ORCH] Sending LEAVE to ${TARGET}"
+echo "[ORCH] Sending LEAVE to node"
 
 # prima avviso il nodo stesso, così parte il gossip
-printf "LEAVE %s\n" "${TARGET}:8000" | nc "${TARGET}" 8000
+printf "LEAVE %s\n" "node3:8000" | nc "node3" 8000
+
+echo "killing:node4 in ${KILL_AFTER}s"
+sleep "${KILL_AFTER}"
+docker kill node4
+
 
 
 echo "[ORCH] All orchestrations complete."

@@ -11,10 +11,10 @@ import (
 )
 
 const (
-	probePeriod    = 5 * time.Second
-	probeTimeout   = 500 * time.Millisecond
+	probePeriod    = 1 * time.Second
+	probeTimeout   = 1 * time.Second
 	dumpInterval   = 10 * time.Second
-	suspectTimeout = 15 * time.Second
+	suspectTimeout = 5 * time.Second
 )
 
 func enqueue(e Event) {
@@ -44,7 +44,7 @@ func listenGossipUDP(conn *net.UDPConn) {
 	for {
 		n, src, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			log.Printf("[GOSSIP-UDP] read error: %v", err)
+			log.Printf("[GOSSIP] read error: %v", err)
 			continue
 		}
 		for _, line := range strings.Split(string(buf[:n]), "\n") {
@@ -53,22 +53,106 @@ func listenGossipUDP(conn *net.UDPConn) {
 				continue
 			}
 			parts := strings.Fields(line)
+			hops := getHops()
 			switch parts[0] {
-			case "PING": // PING <origin>
-				if len(parts) != 2 {
+
+			case "PING": // PING <origin> <inc>
+				hops = getHops()
+				if len(parts) != 3 {
 					continue
 				}
 				origin := parts[1]
-				// 1) aggiorna subito Alive via SWIM
-				updateFromRemote(EvAlive, origin, 0)
-				// 2) rispondi con ACK via UDP
-				reply := []byte(fmt.Sprintf("ACK %s\n", selfAddr))
-				if _, err := conn.WriteToUDP(reply, src); err != nil {
-					log.Printf("[GOSSIP-UDP] ACK to %s failed: %v", src.String(), err)
+				var remoteInc uint64
+				fmt.Sscanf(parts[2], "%d", &remoteInc)
+
+				// ── resurrection logic ──
+				memMu.Lock()
+				m, exists := members[origin]
+				if !exists || m.State == Dead {
+					remoteInc++
+
+					// notifico il registry UNA SOLA volta per questa incarnation
+					resurrectNotifiedMu.Lock()
+					if resurrectNotified[origin] != remoteInc {
+						notifyRegistryAlive(origin)
+						resurrectNotified[origin] = remoteInc
+					}
+					resurrectNotifiedMu.Unlock()
+
+					members[origin] = &Member{
+						Addr:        origin,
+						State:       Alive,
+						Incarnation: remoteInc,
+						LastAck:     time.Now(),
+					}
+					enqueue(Event{
+						Kind:        EvAlive,
+						Addr:        origin,
+						Incarnation: remoteInc,
+						HopsLeft:    getHops(),
+					})
+					log.Printf("[SWIM] resurrected %s with inc=%d via PING", origin, remoteInc)
+					go gossipNowUDP()
 				}
-				// 3) piggy-back dei tuoi eventi sul canale UDP di reply
-				//    (se vuoi, puoi piggyback anche qui, ma non è necessario)
+				memMu.Unlock()
+
+				// normale processing Alive
+				updateFromRemote(EvAlive, origin, remoteInc)
+
+				// rispondo con ACK
+				reply := []byte(fmt.Sprintf("ACK %s\n", selfAddr))
+				_, _ = conn.WriteToUDP(reply, src)
+
+			case "PING-REQ": // PING-REQ <target> <origin> <inc>
+				hops = getHops()
+				if len(parts) != 4 {
+					continue
+				}
+				target := parts[1]
+				origin := parts[2]
+				var remoteInc uint64
+				fmt.Sscanf(parts[3], "%d", &remoteInc)
+
+				// resurrection logic per l’origin
+				memMu.Lock()
+				m, exists := members[origin]
+				if !exists || m.State == Dead {
+					remoteInc++
+
+					resurrectNotifiedMu.Lock()
+					if resurrectNotified[origin] != remoteInc {
+						notifyRegistryAlive(origin)
+						resurrectNotified[origin] = remoteInc
+					}
+					resurrectNotifiedMu.Unlock()
+
+					members[origin] = &Member{
+						Addr:        origin,
+						State:       Alive,
+						Incarnation: remoteInc,
+						LastAck:     time.Now(),
+					}
+					enqueue(Event{
+						Kind:        EvAlive,
+						Addr:        origin,
+						Incarnation: remoteInc,
+						HopsLeft:    getHops(),
+					})
+					log.Printf("[SWIM] resurrected %s with inc=%d via PING-REQ", origin, remoteInc)
+					go gossipNowUDP()
+				}
+				memMu.Unlock()
+
+				// giro il PING reale verso target, piggy‑back ecc.
+				udpAddr, err := net.ResolveUDPAddr("udp", target)
+				if err == nil {
+					msg := []byte(fmt.Sprintf("PING %s %d\n", origin, remoteInc))
+					_, _ = conn.WriteToUDP(msg, udpAddr)
+				}
+				sendPiggybackUDP(conn, src)
+
 			case "ACK": // ACK <who>
+				hops = getHops()
 				if len(parts) != 2 {
 					continue
 				}
@@ -76,41 +160,124 @@ func listenGossipUDP(conn *net.UDPConn) {
 				if chAny, ok := ackWaiters.LoadAndDelete(who); ok {
 					close(chAny.(chan struct{}))
 				}
-			case "JOIN": // JOIN <newAddr>
-				if len(parts) != 2 {
-					continue
+				// -----------------------------------------------------------------
+				// 2) listenGossipUDP – snippet con la parte JOIN aggiornata
+				//    • Accetta sia "JOIN <addr>" che "JOIN <addr> <inc>"
+				//      (l’incarnation ricevuta viene ignorata → trattata come 0)
+				// -----------------------------------------------------------------
+			case "JOIN": // JOIN <addr> [inc]
+				hops = getHops()
+				if len(parts) < 2 || len(parts) > 3 {
+					continue // formato non valido
 				}
 				newAddr := parts[1]
 
-				// 1) aggiorno la membership locale
-				updateFromRemote(EvJoin, newAddr, 0)
-
-				// 2) stampo subito la lista aggiornata
+				// 1) Se già conosco il peer, ignoro TUTTO (no update, no piggyback)
 				memMu.Lock()
-				var peers []string
-				for addr := range members {
-					peers = append(peers, addr)
+				_, known := members[newAddr]
+				memMu.Unlock()
+				if known {
+					continue
+				}
+
+				// 2) Altrimenti è davvero un nuovo join: lo processiamo
+				memMu.Lock()
+				members[newAddr] = &Member{
+					Addr:        newAddr,
+					State:       Alive,
+					Incarnation: 0,
+					LastAck:     time.Now(), // ← inizializzo l’ack qui
 				}
 				memMu.Unlock()
-				log.Printf("[GOSSIP-UDP] membership after JOIN: %v", peers)
 
-				// 3) piggy-back dei nostri eventi verso chi ha inviato il JOIN
+				enqueue(Event{
+					Kind:        EvJoin,
+					Addr:        newAddr,
+					Incarnation: 0,
+					HopsLeft:    getHops(),
+				})
+				log.Printf("[GOSSIP] membership after JOIN: %v", memberAddrs())
 				sendPiggybackUDP(conn, src)
-			case "SUSPECT": // SUSPECT <addr> <inc>
-				if len(parts) != 3 {
-					continue
-				}
-				var inc uint64
-				fmt.Sscanf(parts[2], "%d", &inc)
-				updateFromRemote(EvSuspect, parts[1], inc)
-			case "DEAD": // DEAD <addr> <inc>
-				if len(parts) != 3 {
-					continue
-				}
-				var inc uint64
-				fmt.Sscanf(parts[2], "%d", &inc)
-				updateFromRemote(EvDead, parts[1], inc)
 
+			case "SUSPECT": // SUSPECT <addr> <inc>
+				hops = getHops()
+				if len(parts) != 3 {
+					continue
+				}
+				target := parts[1]
+				var remoteInc uint64
+				fmt.Sscanf(parts[2], "%d", &remoteInc)
+
+				// ── se mi auto‑sospettano, faccio l’unico bump e gossipo Alive ──
+				if target == selfAddr {
+					memMu.Lock()
+					self := members[selfAddr]
+					if remoteInc >= self.Incarnation {
+						self.Incarnation = remoteInc + 1 // unico bump
+						enqueue(Event{                   // gossipo Alive con nuovo inc
+							Kind:        EvAlive,
+							Addr:        selfAddr,
+							Incarnation: self.Incarnation,
+							HopsLeft:    hops,
+						})
+						log.Printf("[SWIM] self‑suspect: bump+Alive inc=%d", self.Incarnation)
+						go gossipNowUDP() // push immediato
+					}
+					memMu.Unlock()
+					continue
+				}
+
+				// ── altrimenti, aggiornamento standard per gli altri peer ──
+				updateFromRemote(EvSuspect, target, remoteInc)
+
+			case "DEAD": // DEAD <addr> <inc>
+				hops = getHops()
+				if len(parts) != 3 {
+					continue
+				}
+				target := parts[1]
+				var remoteInc uint64
+				fmt.Sscanf(parts[2], "%d", &remoteInc)
+
+				// ── se ci dichiarano morti, bump & Alive ──
+				if target == selfAddr {
+					memMu.Lock()
+					self := members[selfAddr]
+					if remoteInc >= self.Incarnation {
+						self.Incarnation = remoteInc + 1 // unico bump
+						enqueue(Event{                   // gossipa Alive
+							Kind:        EvAlive,
+							Addr:        selfAddr,
+							Incarnation: self.Incarnation,
+							HopsLeft:    hops,
+						})
+						log.Printf("[SWIM] self‑dead: bump+Alive inc=%d", self.Incarnation)
+						go notifyRegistryAlive(selfAddr) // ←── aggiungi questa linea
+						go gossipNowUDP()                // push immediato
+					}
+					memMu.Unlock()
+					continue
+				}
+
+				// ── altrimenti, comportamento standard per gli altri ──
+				var inc uint64
+				fmt.Sscanf(parts[2], "%d", &inc)
+				updateFromRemote(EvDead, target, inc)
+			case "LEAVE": // LEAVE <addr>
+				hops = getHops()
+				if len(parts) != 2 {
+					continue
+				}
+				victim := parts[1]
+				memMu.Lock()
+				if _, ok := members[victim]; ok {
+					delete(members, victim)
+					log.Printf("[SWIM] %s left the cluster", victim)
+				}
+				memMu.Unlock()
+				// Optionally piggy‑back this event further
+				enqueue(Event{Kind: EvLeave, Addr: victim, Incarnation: 0, HopsLeft: hops})
+				go gossipNowUDP()
 			}
 		}
 	}
@@ -123,19 +290,24 @@ func pingPeerUDP(peer string, timeout time.Duration) bool {
 	ackWaiters.Store(peer, ch)
 	defer ackWaiters.Delete(peer)
 
-	// invia PING <selfAddr>
+	// 1) prendi la tua incarnation corrente
+	memMu.Lock()
+	myInc := members[selfAddr].Incarnation
+	memMu.Unlock()
+
+	// 2) invia PING <selfAddr> <incarnation>
 	udpAddr, err := net.ResolveUDPAddr("udp", peer)
 	if err != nil {
 		log.Printf("[PING-UDP] bad addr %s: %v", peer, err)
 		return false
 	}
-	msg := []byte(fmt.Sprintf("PING %s\n", selfAddr))
+	msg := []byte(fmt.Sprintf("PING %s %d\n", selfAddr, myInc))
 	if _, err := udpConnection.WriteToUDP(msg, udpAddr); err != nil {
 		log.Printf("[PING-UDP] write to %s failed: %v", peer, err)
 		return false
 	}
 
-	// aspetta ACK o timeout
+	// 3) aspetta ACK o timeout
 	select {
 	case <-ch:
 		return true
@@ -185,40 +357,27 @@ func indirectPingUDP(proxy, target, origin string, timeout time.Duration) bool {
 	}
 }
 
-// antiEntropyLoopUDP effettua periodicamente un push gossip
-// a k = ceil(log2(N+1)) peer scelti a caso (skip self/SUSPECT/DEAD)
 func antiEntropyLoopUDP(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for range ticker.C {
-		gossipNowUDP()
-	}
-}
-
-func reaperLoop() {
-	ticker := time.NewTicker(suspectTimeout / 2)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		now := time.Now()
-		var toKill []string
-
-		// 1) sotto lock raccolgo i suspect scaduti
+		// ——— SELF-DEFENCE: “risveglio” automatico ———
+		// Prendo la mia incarnation corrente
 		memMu.Lock()
-		for _, m := range members {
-			if m.Addr == selfAddr {
-				continue
-			}
-			if m.State == Suspect && now.Sub(m.LastAck) > suspectTimeout {
-				toKill = append(toKill, m.Addr)
-			}
-		}
+		self := members[selfAddr]
+		inc := self.Incarnation
 		memMu.Unlock()
 
-		// 2) fuori dal lock promuovo a DEAD
-		for _, addr := range toKill {
-			markDead(addr)
-		}
+		// Metto in coda un EvAlive per me stesso
+		enqueue(Event{
+			Kind:        EvAlive,
+			Addr:        selfAddr,
+			Incarnation: inc,
+			HopsLeft:    getHops(),
+		})
+
+		// ——— PUSH GOSSIP vero e proprio ———
+		gossipNowUDP()
 	}
 }
 
@@ -235,14 +394,12 @@ func markDead(addr string) {
 	memMu.Lock()
 	if m, ok := members[addr]; ok && m.State != Dead {
 		m.State = Dead
-		m.Incarnation++
 		enqueue(Event{
 			Kind:        EvDead,
 			Addr:        addr,
 			Incarnation: m.Incarnation,
 			HopsLeft:    hopsLeft,
 		})
-		log.Printf("[SWIM] mark DEAD %s (inc=%d)", addr, m.Incarnation)
 	}
 	memMu.Unlock()
 
@@ -252,46 +409,99 @@ func markDead(addr string) {
 }
 
 // probeLoopUDP esegue periodicamente il failure‐detector tramite UDP
+// -----------------------------------------------------------------------------
+// STRICT‑SWIM IMPLEMENTATION
+//   • probeLoopUDP  → solo PING, SUSPECT, ping‑req; non marca mai DEAD
+//   • reaperLoop    → unico punto in cui si passa da SUSPECT a DEAD
+//   • commenti in inglese, come richiesto
+// -----------------------------------------------------------------------------
+
+// probeLoopUDP implements the original SWIM failure‑detector strictly:
+//  1. choose a random ALIVE peer every probePeriod
+//  2. send a direct PING and wait up to probeTimeout for an ACK
+//  3. if no ACK, mark the peer SUSPECT and fan‑out k PING‑REQ helpers
+//  4. if still no ACK, the peer REMAINS SUSPECT               ←── key change
+//  5. promotion to DEAD happens only in reaperLoop, once suspectTimeout expires
 func probeLoopUDP() {
 	ticker := time.NewTicker(probePeriod)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		// 1) sceglie un peer Alive a caso (escludendo se stesso)
+		// 1) pick a random ALIVE peer (excluding self)
 		target := pickRandomPeer(selfAddr)
 		if target == "" {
 			continue
 		}
 		log.Printf("[SWIM] probe → %s", target)
 
-		// 2) ping diretto via UDP
+		// 2) direct PING
 		if directPingUDP(target, probeTimeout) {
-			// ACK ricevuto: mark Alive e gossipa ALIVE
+			recordAck(target) // got ACK → ALIVE
+			continue
+		}
+
+		// 3) no direct ACK → mark SUSPECT
+		markSuspect(target)
+
+		// 4) send k PING‑REQ helpers
+		helpers := chooseKRandomExcept([]string{selfAddr, target}, getFanout())
+		gotAck := make(chan struct{}, 1)
+
+		for _, h := range helpers {
+			go func(proxy string) {
+				if indirectPingUDP(proxy, target, selfAddr, probeTimeout) {
+					gotAck <- struct{}{}
+				}
+			}(h)
+		}
+
+		// 5) wait for an indirect ACK
+		select {
+		case <-gotAck:
+			log.Printf("[SWIM] indirect ACK from %s via helper", target)
 			recordAck(target)
-		} else {
-			// 3) nessun ACK: mark Suspect e avvia ping-req indiretti
-			markSuspect(target)
-
-			helpers := chooseKRandomExcept([]string{selfAddr, target}, getFanout())
-			gotAck := make(chan struct{}, 1)
-
-			for _, h := range helpers {
-				go func(proxy string) {
-					if indirectPingUDP(proxy, target, selfAddr, probeTimeout) {
-						gotAck <- struct{}{}
-					}
-				}(h)
+		case <-time.After(probeTimeout):
+			memMu.Lock()
+			state := members[target].State
+			memMu.Unlock()
+			if state == Suspect {
+				log.Printf("[SWIM] no ACK (direct+indirect) for %s, remains SUSPECT", target)
 			}
 
-			// 4) aspetta il primo ACK indiretto o timeout
-			select {
-			case <-gotAck:
-				log.Printf("[SWIM] indirect ACK from %s via helper", target)
-				recordAck(target)
-			case <-time.After(probeTimeout):
-				// 5) ancora nulla: mark Dead e gossipa DEAD
-				markDead(target)
+			// STRICT‑SWIM: do *not* mark DEAD here.
+
+		}
+	}
+}
+
+// reaperLoop is the *only* place where a SUSPECT peer becomes DEAD.
+// It checks every suspectTimeout/2 and promotes peers whose LastAck is older
+// than suspectTimeout. This implements SWIM’s “subsequent accusation” rule.
+func reaperLoop() {
+	ticker := time.NewTicker(suspectTimeout / 2)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		now := time.Now()
+		var toKill []string
+
+		// collect expired suspects under lock
+		memMu.Lock()
+		for _, m := range members {
+			if m.Addr == selfAddr {
+				continue
 			}
+			if m.State == Suspect && now.Sub(m.LastAck) > suspectTimeout {
+				toKill = append(toKill, m.Addr)
+			}
+		}
+		memMu.Unlock()
+
+		// promote to DEAD outside the lock
+		for _, addr := range toKill {
+			log.Printf("[SWIM:REAPER] mark DEAD %s", addr)
+
+			markDead(addr)
 		}
 	}
 }
@@ -301,21 +511,27 @@ func markSuspect(addr string) {
 	if addr == selfAddr {
 		return
 	}
-	// 1) Sotto lock brevissimo cambio stato e inc e queue
+	// 0) calcolo hops FUORI dal lock per evitare deadlock
+	hops := getHops()
+
+	// 1) Sotto lock brevissimo cambio stato, incarnation e queue
 	memMu.Lock()
 	if m, ok := members[addr]; ok && m.State == Alive {
 		m.State = Suspect
 		m.Incarnation++
+		susTime := time.Now()
+		m.LastAck = susTime
 		enqueue(Event{
 			Kind:        EvSuspect,
 			Addr:        addr,
 			Incarnation: m.Incarnation,
-			HopsLeft:    getHops(),
+			HopsLeft:    hops,
 		})
 		log.Printf("[SWIM] mark SUSPECT %s (inc=%d)", addr, m.Incarnation)
 	}
 	memMu.Unlock()
-	// 2) Spin off immediato di un gossip push verso un sottoinsieme di peer
+
+	// 2) Spin‐off immediato di un gossip push verso un sottoinsieme di peer
 	gossipNowUDP()
 }
 
@@ -353,8 +569,17 @@ func sendPiggybackUDP(conn *net.UDPConn, dst *net.UDPAddr) {
 
 	var buf bytes.Buffer
 	nextQ := make([]Event, 0, len(eventQ))
+
 	for _, e := range eventQ {
-		buf.WriteString(fmt.Sprintf("%s %s %d\n", e.Kind, e.Addr, e.Incarnation))
+		switch e.Kind {
+		case EvJoin:
+			// JOIN ha solo 2 campi
+			buf.WriteString(fmt.Sprintf("JOIN %s\n", e.Addr))
+		default:
+			// tutti gli altri: "<KIND> <addr> <inc>\n"
+			buf.WriteString(fmt.Sprintf("%s %s %d\n", e.Kind, e.Addr, e.Incarnation))
+		}
+
 		e.HopsLeft--
 		if e.HopsLeft > 0 {
 			nextQ = append(nextQ, e)
@@ -362,22 +587,14 @@ func sendPiggybackUDP(conn *net.UDPConn, dst *net.UDPAddr) {
 	}
 	eventQ = nextQ
 
-	data := buf.Bytes()
-	if len(data) == 0 {
+	if buf.Len() == 0 {
 		return
 	}
 
-	// Se il socket è "connected" (DialUDP), usa Write; altrimenti WriteToUDP
 	if conn.RemoteAddr() != nil {
-		// socket connesso → invia con Write
-		if _, err := conn.Write(data); err != nil {
-			log.Printf("[GOSSIP-UDP] write (connected) to %s failed: %v", conn.RemoteAddr(), err)
-		}
+		_, _ = conn.Write(buf.Bytes())
 	} else {
-		// socket non connesso (listener) → invia verso dst
-		if _, err := conn.WriteToUDP(data, dst); err != nil {
-			log.Printf("[GOSSIP-UDP] writeToUDP to %s failed: %v", dst.String(), err)
-		}
+		_, _ = conn.WriteToUDP(buf.Bytes(), dst)
 	}
 }
 
@@ -459,4 +676,16 @@ func parseEventType(s string) EventType {
 	default:
 		return EvUnknown
 	}
+}
+
+func alreadySeen(e Event) bool {
+	k := fmt.Sprintf("%d|%s", e.Kind, e.Addr)
+	seenMu.Lock()
+	defer seenMu.Unlock()
+	old, exists := seen[k]
+	if exists && e.Incarnation <= old {
+		return true
+	}
+	seen[k] = e.Incarnation
+	return false
 }
