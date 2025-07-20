@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"math/rand"
 	"net"
 	"strings"
 	"time"
@@ -12,10 +13,9 @@ import (
 
 const (
 	probePeriod    = 1 * time.Second
-	probeTimeout   = 1 * time.Second
+	probeTimeout   = 900 * time.Millisecond
+	suspectTimeout = 6 * time.Second
 	dumpInterval   = 10 * time.Second
-	suspectTimeout = 5 * time.Second
-	gracePeriod    = 10 * time.Second
 )
 
 func enqueue(e Event) {
@@ -34,6 +34,16 @@ func getHops() int {
 	hops := int(math.Ceil(math.Log2(float64(N) + 1)))
 
 	return hops
+}
+
+// computeGraceHops restituisce quanti round di probe saltare:
+// un numero pari a log₂(N+1) + suspectTimeout/probePeriod
+func computeGraceHops() int {
+	// hops per topologia
+	base := getHops()
+	// round necessari a coprire suspectTimeout
+	extra := int(math.Ceil(float64(suspectTimeout) / float64(probePeriod)))
+	return base + extra
 }
 
 // -----------------------------------------------------------------
@@ -55,10 +65,37 @@ func listenGossipUDP(conn *net.UDPConn) {
 			}
 			parts := strings.Fields(line)
 			hops := getHops()
+			gracehops := computeGraceHops()
 			switch parts[0] {
 
+			case "MEMBERSHIP":
+				// MEMBERSHIP <addr> <inc> <state> <graceHops>
+				if len(parts) != 5 {
+					continue
+				}
+				peer := parts[1]
+				var inc uint64
+				fmt.Sscanf(parts[2], "%d", &inc)
+				var grace int
+				fmt.Sscanf(parts[4], "%d", &grace)
+
+				memMu.Lock()
+				m, ok := members[peer]
+				if !ok {
+					m = &Member{Addr: peer}
+					members[peer] = m
+				}
+				if inc > m.Incarnation {
+					m.Incarnation = inc
+				}
+				m.State = Alive        // <-- forza Alive
+				m.LastAck = time.Now() // <-- rinfresca il timeout
+				if grace > m.GraceHops {
+					m.GraceHops = grace
+				}
+				memMu.Unlock()
+
 			case "PING": // PING <origin> <inc>
-				hops = getHops()
 				if len(parts) != 3 {
 					continue
 				}
@@ -69,7 +106,7 @@ func listenGossipUDP(conn *net.UDPConn) {
 				// ── resurrection logic ──
 				memMu.Lock()
 				m, exists := members[origin]
-				if !exists || m.State == Dead {
+				if !exists && m.State == Dead {
 					remoteInc++
 
 					// notifico il registry UNA SOLA volta per questa incarnation
@@ -85,13 +122,13 @@ func listenGossipUDP(conn *net.UDPConn) {
 						State:       Alive,
 						Incarnation: remoteInc,
 						LastAck:     time.Now(),
-						GraceUntil:  time.Now().Add(gracePeriod),
+						GraceHops:   gracehops,
 					}
 					enqueue(Event{
 						Kind:        EvAlive,
 						Addr:        origin,
 						Incarnation: remoteInc,
-						HopsLeft:    getHops(),
+						HopsLeft:    hops,
 					})
 					log.Printf("[SWIM] resurrected %s with inc=%d via PING", origin, remoteInc)
 					go gossipNowUDP()
@@ -107,7 +144,6 @@ func listenGossipUDP(conn *net.UDPConn) {
 				sendPiggybackUDP(conn, src)
 
 			case "PING-REQ": // PING-REQ <target> <origin> <inc>
-				hops = getHops()
 				if len(parts) != 4 {
 					continue
 				}
@@ -119,7 +155,7 @@ func listenGossipUDP(conn *net.UDPConn) {
 				// resurrection logic per l’origin
 				memMu.Lock()
 				m, exists := members[origin]
-				if !exists || m.State == Dead {
+				if !exists && m.State == Dead {
 					remoteInc++
 
 					resurrectNotifiedMu.Lock()
@@ -134,13 +170,13 @@ func listenGossipUDP(conn *net.UDPConn) {
 						State:       Alive,
 						Incarnation: remoteInc,
 						LastAck:     time.Now(),
-						GraceUntil:  time.Now().Add(gracePeriod),
+						GraceHops:   gracehops,
 					}
 					enqueue(Event{
 						Kind:        EvAlive,
 						Addr:        origin,
 						Incarnation: remoteInc,
-						HopsLeft:    getHops(),
+						HopsLeft:    hops,
 					})
 					log.Printf("[SWIM] resurrected %s with inc=%d via PING-REQ", origin, remoteInc)
 					go gossipNowUDP()
@@ -156,7 +192,6 @@ func listenGossipUDP(conn *net.UDPConn) {
 				sendPiggybackUDP(conn, src)
 
 			case "ACK": // ACK <who>
-				hops = getHops()
 				if len(parts) != 2 {
 					continue
 				}
@@ -174,7 +209,6 @@ func listenGossipUDP(conn *net.UDPConn) {
 				//      (l’incarnation ricevuta viene ignorata → trattata come 0)
 				// -----------------------------------------------------------------
 			case "JOIN": // JOIN <addr> [inc]
-				hops = getHops()
 				if len(parts) < 2 || len(parts) > 3 {
 					continue // formato non valido
 				}
@@ -195,7 +229,7 @@ func listenGossipUDP(conn *net.UDPConn) {
 					State:       Alive,
 					Incarnation: 0,
 					LastAck:     time.Now(), // ← inizializzo l’ack qui
-					GraceUntil:  time.Now().Add(gracePeriod),
+					GraceHops:   gracehops,
 				}
 				memMu.Unlock()
 
@@ -203,13 +237,12 @@ func listenGossipUDP(conn *net.UDPConn) {
 					Kind:        EvJoin,
 					Addr:        newAddr,
 					Incarnation: 0,
-					HopsLeft:    getHops(),
+					HopsLeft:    hops,
 				})
 				log.Printf("[GOSSIP] membership after JOIN: %v", memberAddrs())
 				sendPiggybackUDP(conn, src)
 
 			case "SUSPECT": // SUSPECT <addr> <inc>
-				hops = getHops()
 				if len(parts) != 3 {
 					continue
 				}
@@ -240,7 +273,6 @@ func listenGossipUDP(conn *net.UDPConn) {
 				updateFromRemote(EvSuspect, target, remoteInc)
 
 			case "DEAD": // DEAD <addr> <inc>
-				hops = getHops()
 				if len(parts) != 3 {
 					continue
 				}
@@ -273,7 +305,6 @@ func listenGossipUDP(conn *net.UDPConn) {
 				fmt.Sscanf(parts[2], "%d", &inc)
 				updateFromRemote(EvDead, target, inc)
 			case "LEAVE": // LEAVE <addr>
-				hops = getHops()
 				if len(parts) != 2 {
 					continue
 				}
@@ -287,6 +318,27 @@ func listenGossipUDP(conn *net.UDPConn) {
 				// Optionally piggy‑back this event further
 				enqueue(Event{Kind: EvLeave, Addr: victim, Incarnation: 0, HopsLeft: hops})
 				go gossipNowUDP()
+			case "ALIVE": // ALIVE <addr> <inc> <graceHops>
+				// il messaggio di gossip “alive” deve avere esattamente 4 parti
+				if len(parts) != 4 {
+					continue
+				}
+				origin := parts[1]
+				var remoteInc uint64
+				fmt.Sscanf(parts[2], "%d", &remoteInc)
+				var remoteGrace int
+				fmt.Sscanf(parts[3], "%d", &remoteGrace)
+
+				// 1) aggiorno stato/incarnation
+				updateFromRemote(EvAlive, origin, remoteInc)
+
+				// 2) sincronizzo il graceHops remoto se è più alto
+				memMu.Lock()
+				if m, ok := members[origin]; ok && remoteGrace > m.GraceHops {
+					m.GraceHops = remoteGrace
+				}
+				memMu.Unlock()
+
 			}
 		}
 	}
@@ -366,27 +418,61 @@ func indirectPingUDP(proxy, target, origin string, timeout time.Duration) bool {
 	}
 }
 
+// sendMembershipUDP serializza in formato:
+// MEMBERSHIP <addr> <incarnation> <state> <graceHops>\n
+// per ogni membro (escludendo self)
+func sendMembershipUDP(conn *net.UDPConn) {
+	evMu.Lock()
+	defer evMu.Unlock()
+
+	var buf bytes.Buffer
+	memMu.Lock()
+	for addr, m := range members {
+		if addr == selfAddr {
+			continue
+		}
+		// m.State.String() deve restituire "Alive", "Suspect", "Dead"
+		buf.WriteString(fmt.Sprintf("MEMBERSHIP %s %d %s %d\n",
+			addr, m.Incarnation, m.State.String(), m.GraceHops))
+	}
+	memMu.Unlock()
+
+	if buf.Len() > 0 {
+		conn.Write(buf.Bytes())
+	}
+}
+
 func antiEntropyLoopUDP(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for range ticker.C {
-		// ——— SELF-DEFENCE: “risveglio” automatico ———
-		// Prendo la mia incarnation corrente
+		// 1) scegli un peer a caso (escludendo te stesso)
 		memMu.Lock()
-		self := members[selfAddr]
-		inc := self.Incarnation
+		var peers []string
+		for addr := range members {
+			if addr != selfAddr {
+				peers = append(peers, addr)
+			}
+		}
 		memMu.Unlock()
+		log.Printf("[ANTI‑ENTROPY] pushing self‑heartbeat")
+		if len(peers) == 0 {
+			continue
+		}
+		target := peers[rand.Intn(len(peers))]
 
-		// Metto in coda un EvAlive per me stesso
-		enqueue(Event{
-			Kind:        EvAlive,
-			Addr:        selfAddr,
-			Incarnation: inc,
-			HopsLeft:    getHops(),
-		})
+		// 2) serializza e invia lo snapshot di membership
+		udpAddr, err := net.ResolveUDPAddr("udp", target)
+		if err != nil {
+			continue
+		}
+		conn, err := net.DialUDP("udp", nil, udpAddr)
+		if err != nil {
+			continue
+		}
 
-		// ——— PUSH GOSSIP vero e proprio ———
-		gossipNowUDP()
+		sendMembershipUDP(conn)
+		conn.Close()
 	}
 }
 
@@ -417,25 +503,20 @@ func markDead(addr string) {
 	go gossipNowUDP()
 }
 
-// probeLoopUDP esegue periodicamente il failure‐detector tramite UDP
-// -----------------------------------------------------------------------------
-// STRICT‑SWIM IMPLEMENTATION
-//   • probeLoopUDP  → solo PING, SUSPECT, ping‑req; non marca mai DEAD
-//   • reaperLoop    → unico punto in cui si passa da SUSPECT a DEAD
-//   • commenti in inglese, come richiesto
-// -----------------------------------------------------------------------------
-
-// probeLoopUDP implements the original SWIM failure‑detector strictly:
-//  1. choose a random ALIVE peer every probePeriod
-//  2. send a direct PING and wait up to probeTimeout for an ACK
-//  3. if no ACK, mark the peer SUSPECT and fan‑out k PING‑REQ helpers
-//  4. if still no ACK, the peer REMAINS SUSPECT               ←── key change
-//  5. promotion to DEAD happens only in reaperLoop, once suspectTimeout expires
 func probeLoopUDP() {
 	ticker := time.NewTicker(probePeriod)
 	defer ticker.Stop()
 
 	for range ticker.C {
+		// —————— 0) DECRESCITA DEL GRACE-PERIOD ——————
+		memMu.Lock()
+		for _, m := range members {
+			if m.GraceHops > 0 {
+				m.GraceHops--
+			}
+		}
+		memMu.Unlock()
+
 		// 1) pick a random ALIVE peer (excluding self)
 		target := pickRandomPeer(selfAddr)
 		if target == "" {
@@ -449,13 +530,12 @@ func probeLoopUDP() {
 			continue
 		}
 
-		// 3) no direct ACK → mark SUSPECT
+		// 3) no direct ACK → mark SUSPECT (skip if still in grace)
 		markSuspect(target)
 
 		// 4) send k PING‑REQ helpers
 		helpers := chooseKRandomExcept([]string{selfAddr, target}, getFanout())
 		gotAck := make(chan struct{}, 1)
-
 		for _, h := range helpers {
 			go func(proxy string) {
 				if indirectPingUDP(proxy, target, selfAddr, probeTimeout) {
@@ -476,9 +556,7 @@ func probeLoopUDP() {
 			if state == Suspect {
 				log.Printf("[SWIM] no ACK (direct+indirect) for %s, remains SUSPECT", target)
 			}
-
 			// STRICT‑SWIM: do *not* mark DEAD here.
-
 		}
 	}
 }
@@ -486,6 +564,7 @@ func probeLoopUDP() {
 // reaperLoop is the *only* place where a SUSPECT peer becomes DEAD.
 // It checks every suspectTimeout/2 and promotes peers whose LastAck is older
 // than suspectTimeout. This implements SWIM’s “subsequent accusation” rule.
+// reaperLoop è l’unico punto dove un peer SUSPECT → DEAD
 func reaperLoop() {
 	ticker := time.NewTicker(suspectTimeout / 2)
 	defer ticker.Stop()
@@ -494,7 +573,7 @@ func reaperLoop() {
 		now := time.Now()
 		var toKill []string
 
-		// collect expired suspects under lock
+		// 1) raccolgo in lock tutti i suspect scaduti
 		memMu.Lock()
 		for _, m := range members {
 			if m.Addr == selfAddr {
@@ -506,10 +585,9 @@ func reaperLoop() {
 		}
 		memMu.Unlock()
 
-		// promote to DEAD outside the lock
+		// 2) per ognuno, log di CONFIRM e poi markDead
 		for _, addr := range toKill {
-			log.Printf("[SWIM:REAPER] mark DEAD %s", addr)
-
+			log.Printf("[SWIM] CONFIRM DEAD %s", addr)
 			markDead(addr)
 		}
 	}
@@ -526,10 +604,11 @@ func markSuspect(addr string) {
 	// 1) Sotto lock brevissimo cambio stato, incarnation e queue
 	memMu.Lock()
 	if m, ok := members[addr]; ok && m.State == Alive {
-		if time.Now().Before(m.GraceUntil) {
+		if m.GraceHops > 0 {
+			m.GraceHops--
 			// ancora nel periodo di grazia → ignoro
 			memMu.Unlock()
-			log.Printf("[SWIM] %s è in grace-period, skip SUSPECT", addr)
+			log.Printf("[SWIM] skipping SUSPECT for %s (%d rounds left)", addr, m.GraceHops)
 			return
 		}
 		m.State = Suspect
@@ -553,9 +632,6 @@ func markSuspect(addr string) {
 // recordAck registra l'arrivo di un ACK per addr:
 // - aggiorna LastAck
 // - mette in coda un EvAlive per piggy-backing
-// recordAck registra l'arrivo di un ACK per addr:
-// - aggiorna LastAck
-// - mette in coda un EvAlive per piggy-backing
 func recordAck(addr string) {
 	// 1) calcola hops fuori dal lock
 	hopsLeft := getHops()
@@ -564,7 +640,13 @@ func recordAck(addr string) {
 	memMu.Lock()
 	m, ok := members[addr]
 	if ok {
+		prevState := m.State
 		m.LastAck = time.Now()
+		// se veniva da SUSPECT, facciamo un log specifico
+		if prevState == Suspect {
+			log.Printf("[SWIM] CANCEL SUSPECT %s", addr)
+		}
+		m.State = Alive
 		enqueue(Event{
 			Kind:        EvAlive,
 			Addr:        addr,
@@ -578,6 +660,7 @@ func recordAck(addr string) {
 // -----------------------------------------------------------------
 // 2) Invia in UDP tutti gli eventi in coda (eventQ) a dst
 // -----------------------------------------------------------------
+// sendPiggybackUDP invia in UDP tutti gli eventi in coda (eventQ) a dst
 func sendPiggybackUDP(conn *net.UDPConn, dst *net.UDPAddr) {
 	evMu.Lock()
 	defer evMu.Unlock()
@@ -588,24 +671,40 @@ func sendPiggybackUDP(conn *net.UDPConn, dst *net.UDPAddr) {
 	for _, e := range eventQ {
 		switch e.Kind {
 		case EvJoin:
-			// JOIN ha solo 2 campi
+			// JOIN <addr>
 			buf.WriteString(fmt.Sprintf("JOIN %s\n", e.Addr))
+
+		case EvAlive:
+			// ALIVE <addr> <inc> <graceHops>
+			memMu.Lock()
+			gh := members[e.Addr].GraceHops
+			memMu.Unlock()
+			buf.WriteString(fmt.Sprintf("ALIVE %s %d %d\n",
+				e.Addr, e.Incarnation, gh,
+			))
+
 		default:
-			// tutti gli altri: "<KIND> <addr> <inc>\n"
-			buf.WriteString(fmt.Sprintf("%s %s %d\n", e.Kind, e.Addr, e.Incarnation))
+			// SUSPECT, DEAD, LEAVE
+			buf.WriteString(fmt.Sprintf("%s %s %d\n",
+				e.Kind, e.Addr, e.Incarnation,
+			))
 		}
 
+		// decremento hops left e mantengo solo i messaggi che devono ancora girare
 		e.HopsLeft--
 		if e.HopsLeft > 0 {
 			nextQ = append(nextQ, e)
 		}
 	}
+
 	eventQ = nextQ
 
+	// se non ci sono payload, esco
 	if buf.Len() == 0 {
 		return
 	}
 
+	// invio su conn appropriata
 	if conn.RemoteAddr() != nil {
 		_, _ = conn.Write(buf.Bytes())
 	} else {
@@ -671,26 +770,6 @@ func diffuseJoin(selfAddr string) {
 	eventQ = append(eventQ, e)
 	evMu.Unlock()
 	go gossipNowUDP()
-}
-
-// -----------------------------------------------------------------
-// 5) Helper per convertire la stringa in EventType
-// -----------------------------------------------------------------
-func parseEventType(s string) EventType {
-	switch strings.ToUpper(s) {
-	case "JOIN":
-		return EvJoin
-	case "ALIVE":
-		return EvAlive
-	case "SUSPECT":
-		return EvSuspect
-	case "DEAD":
-		return EvDead
-	case "LEAVE":
-		return EvLeave
-	default:
-		return EvUnknown
-	}
 }
 
 func alreadySeen(e Event) bool {

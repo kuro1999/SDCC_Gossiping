@@ -88,7 +88,10 @@ services:
       - PAUSE_AFTER=${PAUSE_AFTER}
       - PAUSE_DURATION=${PAUSE_DURATION}
       - LEAVE_AFTER=${LEAVE_AFTER}
-      - TARGET=${TARGET}
+      - KILL_AFTER=${KILL_AFTER}
+      - TARGET_PAUSE=${TARGET_PAUSE}
+      - TARGET_LEAVE=${TARGET_LEAVE}
+      - TARGET_KILL=${TARGET_KILL}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./orchestrator.sh:/orchestrator.sh:ro

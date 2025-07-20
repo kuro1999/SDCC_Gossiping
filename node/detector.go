@@ -39,7 +39,7 @@ type Member struct {
 	State       State
 	Incarnation uint64
 	LastAck     time.Time
-	GraceUntil  time.Time
+	GraceHops   int
 }
 
 var (
@@ -101,6 +101,7 @@ type Event struct {
 func updateFromRemote(kind EventType, addr string, inc uint64) {
 	// 0) calcolo hops fuori dal lock
 	hops := getHops()
+	gracehops := computeGraceHops()
 	evt := Event{Kind: kind, Addr: addr, Incarnation: inc, HopsLeft: hops}
 
 	// --- 1) self-defence: se qualcuno ci marca SUSPECT/DEAD, resuscitiamo subito ---
@@ -123,16 +124,22 @@ func updateFromRemote(kind EventType, addr string, inc uint64) {
 		return
 	}
 
-	// --- 2) assicuro l’entry per JOIN/ALIVE remoti ---
+	// --- 2) assicuro che l’entry esista e inizializzo GraceHops se è nuova ---
 	memMu.Lock()
 	m, ok := members[addr]
 	if !ok && (kind == EvAlive || kind == EvJoin) {
-		m = &Member{Addr: addr}
+		m = &Member{
+			Addr:        addr,
+			State:       Alive,
+			Incarnation: inc,
+			LastAck:     time.Now(),
+			GraceHops:   gracehops, // ← inizializzo qui la grazia in hops
+		}
 		members[addr] = m
 	}
 	memMu.Unlock()
 
-	// --- 3) deduplica (ALIVE viaggia sempre) ---
+	// --- 3) deduplica (SUSPECT/DEAD/LEAVE deduplicati, ALIVE sempre passa) ---
 	if alreadySeen(evt) && kind != EvAlive {
 		return
 	}
@@ -144,7 +151,7 @@ func updateFromRemote(kind EventType, addr string, inc uint64) {
 	memMu.Lock()
 	defer memMu.Unlock()
 
-	// se non esiste la entry (es. SUSPECT/DEAD/LEAVE di ignoti), esco
+	// recupero di nuovo entry (potrebbe non esistere per SUSPECT/DEAD ignoti)
 	m, ok = members[addr]
 	if !ok {
 		return
@@ -154,7 +161,11 @@ func updateFromRemote(kind EventType, addr string, inc uint64) {
 	case EvJoin:
 		if inc >= m.Incarnation {
 			changed := inc > m.Incarnation || m.State != Alive
-			*m = Member{Addr: addr, State: Alive, Incarnation: inc, LastAck: time.Now()}
+			// aggiorno solo i campi, mantenendo GraceHops
+			m.State = Alive
+			m.Incarnation = inc
+			m.LastAck = time.Now()
+			m.GraceHops = hops // ← reset grazia su JOIN vero
 			if changed {
 				log.Printf("[SWIM] %s → JOINED (inc=%d)", addr, inc)
 				go notifyRegistryAlive(addr)
@@ -175,6 +186,7 @@ func updateFromRemote(kind EventType, addr string, inc uint64) {
 			m.State = Alive
 			m.Incarnation = inc
 			m.LastAck = time.Now()
+			// NOTA: non resettiamo GraceHops qui, lo sincronizziamo via gossip ALIVE
 			go gossipNowUDP()
 		} else {
 			// semplice refresh di LastAck
@@ -227,6 +239,8 @@ var lastSnap string
 
 func dumpMembership() {
 	t := time.NewTicker(dumpInterval)
+	defer t.Stop()
+
 	for range t.C {
 		memMu.Lock()
 		var snap []string
@@ -234,7 +248,11 @@ func dumpMembership() {
 			if addr == selfAddr {
 				continue
 			}
-			snap = append(snap, fmt.Sprintf("%s:%s(i=%d)", addr, m.State, m.Incarnation))
+			age := time.Since(m.LastAck).Seconds()
+			snap = append(snap, fmt.Sprintf(
+				"%s:%s(i=%d, grace=%d, ack=%.1fs)",
+				addr, m.State, m.Incarnation, m.GraceHops, age,
+			))
 		}
 		memMu.Unlock()
 

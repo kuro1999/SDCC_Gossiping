@@ -146,10 +146,10 @@ func main() {
 	}
 
 	// --- 5) avvio manuale dei loop SWIM → tutti via UDP ---
-	go probeLoopUDP()                       // ping periodici + indirect → Suspect/Dead
-	go reaperLoop()                         // promozione da Suspect a Dead
-	go antiEntropyLoopUDP(10 * time.Second) // push periodico di tutta la eventQ
-	go dumpMembership()                     // log snapshot (opzionale)
+	go probeLoopUDP()                      // ping periodici + indirect → Suspect/Dead
+	go reaperLoop()                        // promozione da Suspect a Dead
+	go antiEntropyLoopUDP(2 * time.Second) // push periodico di tutta la eventQ
+	go dumpMembership()                    // log snapshot (opzionale)
 
 	port := strings.Split(selfAddr, ":")[1]
 	ln, err := net.Listen("tcp", ":"+port)
