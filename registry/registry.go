@@ -152,9 +152,8 @@ func handleConn(conn net.Conn) {
 		if reportCnt >= quorum {
 			if _, exists := pendingRemovals[victim]; !exists {
 				log.Printf(
-					"[REGISTRY] scheduled removal of %s(%s) in %ds",
-					victimID, victim, gracePeriod,
-				)
+					"[REGISTRY] scheduled removal of %s(%s) in %.0fs",
+					victimID, victim, gracePeriod)
 				pendingRemovals[victim] = time.AfterFunc(gracePeriod, func() {
 					peersMu.Lock()
 					defer peersMu.Unlock()

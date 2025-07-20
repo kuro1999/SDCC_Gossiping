@@ -15,6 +15,7 @@ const (
 	probeTimeout   = 1 * time.Second
 	dumpInterval   = 10 * time.Second
 	suspectTimeout = 5 * time.Second
+	gracePeriod    = 10 * time.Second
 )
 
 func enqueue(e Event) {
@@ -84,6 +85,7 @@ func listenGossipUDP(conn *net.UDPConn) {
 						State:       Alive,
 						Incarnation: remoteInc,
 						LastAck:     time.Now(),
+						GraceUntil:  time.Now().Add(gracePeriod),
 					}
 					enqueue(Event{
 						Kind:        EvAlive,
@@ -102,6 +104,7 @@ func listenGossipUDP(conn *net.UDPConn) {
 				// rispondo con ACK
 				reply := []byte(fmt.Sprintf("ACK %s\n", selfAddr))
 				_, _ = conn.WriteToUDP(reply, src)
+				sendPiggybackUDP(conn, src)
 
 			case "PING-REQ": // PING-REQ <target> <origin> <inc>
 				hops = getHops()
@@ -131,6 +134,7 @@ func listenGossipUDP(conn *net.UDPConn) {
 						State:       Alive,
 						Incarnation: remoteInc,
 						LastAck:     time.Now(),
+						GraceUntil:  time.Now().Add(gracePeriod),
 					}
 					enqueue(Event{
 						Kind:        EvAlive,
@@ -160,6 +164,10 @@ func listenGossipUDP(conn *net.UDPConn) {
 				if chAny, ok := ackWaiters.LoadAndDelete(who); ok {
 					close(chAny.(chan struct{}))
 				}
+
+				// NEW: sfruttiamo il pacchetto di ritorno per diffondere gossip
+				sendPiggybackUDP(conn, src) // ← aggiungi questa riga
+
 				// -----------------------------------------------------------------
 				// 2) listenGossipUDP – snippet con la parte JOIN aggiornata
 				//    • Accetta sia "JOIN <addr>" che "JOIN <addr> <inc>"
@@ -187,6 +195,7 @@ func listenGossipUDP(conn *net.UDPConn) {
 					State:       Alive,
 					Incarnation: 0,
 					LastAck:     time.Now(), // ← inizializzo l’ack qui
+					GraceUntil:  time.Now().Add(gracePeriod),
 				}
 				memMu.Unlock()
 
@@ -517,6 +526,12 @@ func markSuspect(addr string) {
 	// 1) Sotto lock brevissimo cambio stato, incarnation e queue
 	memMu.Lock()
 	if m, ok := members[addr]; ok && m.State == Alive {
+		if time.Now().Before(m.GraceUntil) {
+			// ancora nel periodo di grazia → ignoro
+			memMu.Unlock()
+			log.Printf("[SWIM] %s è in grace-period, skip SUSPECT", addr)
+			return
+		}
 		m.State = Suspect
 		m.Incarnation++
 		susTime := time.Now()

@@ -39,6 +39,7 @@ type Member struct {
 	State       State
 	Incarnation uint64
 	LastAck     time.Time
+	GraceUntil  time.Time
 }
 
 var (
