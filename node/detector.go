@@ -88,137 +88,6 @@ type Event struct {
 	HopsLeft    int
 }
 
-// -----------------------------------------------------------------
-// updateFromRemote: applica un evento ricevuto da gossip/SWIM.
-// Ordine:
-//  0. calcola hops fuori lock
-//  1. crea l’entry se mancante (solo JOIN/ALIVE)
-//  2. deduplica; se già visto & non ALIVE => esce
-//  3. enqueue per piggy-back
-//  4. transizioni di stato + side-effects
-//
-// -----------------------------------------------------------------
-func updateFromRemote(kind EventType, addr string, inc uint64) {
-	// 0) calcolo hops fuori dal lock
-	hops := getHops()
-	gracehops := computeGraceHops()
-	evt := Event{Kind: kind, Addr: addr, Incarnation: inc, HopsLeft: hops}
-
-	// --- 1) self-defence: se qualcuno ci marca SUSPECT/DEAD, resuscitiamo subito ---
-	if addr == selfAddr && kind != EvAlive {
-		// bump incarnation sotto lock
-		memMu.Lock()
-		self := members[selfAddr]
-		self.Incarnation++
-		self.State = Alive
-		self.LastAck = time.Now()
-		newInc := self.Incarnation
-		memMu.Unlock()
-
-		// enqueue e broadcast del nuovo ALIVE
-		enqueue(Event{Kind: EvAlive, Addr: selfAddr, Incarnation: newInc, HopsLeft: hops})
-		log.Printf("[SWIM] self-defence → ALIVE (inc=%d)", newInc)
-
-		go notifyRegistryAlive(selfAddr)
-		go gossipNowUDP()
-		return
-	}
-
-	// --- 2) assicuro che l’entry esista e inizializzo GraceHops se è nuova ---
-	memMu.Lock()
-	m, ok := members[addr]
-	if !ok && (kind == EvAlive || kind == EvJoin) {
-		m = &Member{
-			Addr:        addr,
-			State:       Alive,
-			Incarnation: inc,
-			LastAck:     time.Now(),
-			GraceHops:   gracehops, // ← inizializzo qui la grazia in hops
-		}
-		members[addr] = m
-	}
-	memMu.Unlock()
-
-	// --- 3) deduplica (SUSPECT/DEAD/LEAVE deduplicati, ALIVE sempre passa) ---
-	if alreadySeen(evt) && kind != EvAlive {
-		return
-	}
-
-	// --- 4) metto in coda l’evento vero e proprio ---
-	enqueue(evt)
-
-	// --- 5) transizioni di stato sotto lock ---
-	memMu.Lock()
-	defer memMu.Unlock()
-
-	// recupero di nuovo entry (potrebbe non esistere per SUSPECT/DEAD ignoti)
-	m, ok = members[addr]
-	if !ok {
-		return
-	}
-
-	switch kind {
-	case EvJoin:
-		if inc >= m.Incarnation {
-			changed := inc > m.Incarnation || m.State != Alive
-			// aggiorno solo i campi, mantenendo GraceHops
-			m.State = Alive
-			m.Incarnation = inc
-			m.LastAck = time.Now()
-			m.GraceHops = hops // ← reset grazia su JOIN vero
-			if changed {
-				log.Printf("[SWIM] %s → JOINED (inc=%d)", addr, inc)
-				go notifyRegistryAlive(addr)
-				go gossipNowUDP()
-			}
-		}
-
-	case EvAlive:
-		if inc < m.Incarnation {
-			return
-		}
-		changed := inc > m.Incarnation || m.State != Alive
-		if changed {
-			if m.State == Dead {
-				log.Printf("[SWIM] %s resurrected → ALIVE (inc=%d)", addr, inc)
-				go notifyRegistryAlive(addr)
-			}
-			m.State = Alive
-			m.Incarnation = inc
-			m.LastAck = time.Now()
-			// NOTA: non resettiamo GraceHops qui, lo sincronizziamo via gossip ALIVE
-			go gossipNowUDP()
-		} else {
-			// semplice refresh di LastAck
-			m.LastAck = time.Now()
-		}
-
-	case EvSuspect:
-		if inc < m.Incarnation || m.State != Alive {
-			return
-		}
-		m.State = Suspect
-		m.Incarnation = inc
-		log.Printf("[SWIM] %s → SUSPECT (inc=%d)", addr, inc)
-
-	case EvDead:
-		if inc < m.Incarnation || m.State == Dead {
-			return
-		}
-		m.State = Dead
-		m.Incarnation = inc
-		log.Printf("[SWIM] %s → DEAD (inc=%d)", addr, inc)
-		go notifyRegistryDead(addr)
-		go gossipNowUDP()
-
-	case EvLeave:
-		delete(members, addr)
-		log.Printf("[SWIM] %s → voluntarily LEFT", addr)
-		go notifyRegistryLeave(addr)
-		go gossipNowUDP()
-	}
-}
-
 func wasAlreadyMember() bool {
 	var savedIncarnation uint64
 	for addr, m := range members {
@@ -356,6 +225,7 @@ func handleConn(c net.Conn) {
 			continue
 		}
 		switch parts[0] {
+
 		case "REMOVE":
 			hops := getHops()
 			if len(parts) != 2 {
@@ -384,6 +254,12 @@ func handleConn(c net.Conn) {
 			go gossipNowUDP()
 
 			// 3) chiudo subito l’handler
+			return
+
+		case "LEAVE":
+			// Voluntary leave richiesta via TCP:
+			voluntaryLeave()
+			log.Printf("[SWIM] voluntary LEAVE triggered by external command")
 			return
 
 		default:
