@@ -1,24 +1,183 @@
 package main
 
 import (
-	"bytes"
+	"encoding/json"
 	"fmt"
 	"github.com/google/uuid"
 	"log"
 	"math"
 	"net"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	probePeriod    = 1 * time.Second
-	probeTimeout   = 900 * time.Millisecond
-	suspectTimeout = 6 * time.Second
+	probePeriod    = 1*time.Second + 500*time.Millisecond
+	probeTimeout   = 1*time.Second + 100*time.Millisecond
+	suspectTimeout = 8 * time.Second
 	dumpInterval   = 10 * time.Second
 	// gossip.go (o swim.go)
-	maxPiggybackEntries = 100
+	maxPiggybackEntries = 128
 )
+
+type MemberDigestEntry struct {
+	Addr        string `json:"addr"`
+	State       string `json:"state"` // "Alive", "Suspect", "Dead"
+	Incarnation uint64 `json:"incarnation"`
+	LastAck     int64  `json:"last_ack"` // unix nano
+	GraceHops   int    `json:"grace_hops"`
+}
+
+type DigestMessage struct {
+	Type    string              `json:"type"` // "DIGEST" o "SYNC"
+	Entries []MemberDigestEntry `json:"entries"`
+}
+
+func sendDigest(peer string) {
+	// 1) Raccogli lo stato corrente
+	memMu.Lock()
+	entries := make([]MemberDigestEntry, 0, len(members))
+	for _, m := range members {
+		entries = append(entries, MemberDigestEntry{
+			Addr:        m.Addr,
+			State:       m.State.String(),
+			Incarnation: m.Incarnation,
+			LastAck:     m.LastAck.UnixNano(),
+			GraceHops:   m.GraceHops,
+		})
+	}
+	memMu.Unlock()
+
+	// 2) Crea il messaggio JSON
+	msg := DigestMessage{Type: "DIGEST", Entries: entries}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("[ANTI‑ENTROPY] marshal digest: %v", err)
+		return
+	}
+
+	// 3) Invia in UDP
+	udpAddr, err := net.ResolveUDPAddr("udp", peer)
+	if err != nil {
+		log.Printf("[ANTI‑ENTROPY] bad addr %s: %v", peer, err)
+		return
+	}
+	conn, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		log.Printf("[ANTI‑ENTROPY] dial %s: %v", peer, err)
+		return
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write(data); err != nil {
+		log.Printf("[ANTI‑ENTROPY] send digest to %s: %v", peer, err)
+	}
+}
+
+// ——— 3) Gestione in ingresso di DIGEST e SYNC ———
+
+func handleDigest(src *net.UDPAddr, dm DigestMessage, conn *net.UDPConn) {
+	var toSync []MemberDigestEntry
+
+	// 1) Reconciliation: per ogni entry in dm, confronta con local members
+	for _, e := range dm.Entries {
+		memMu.Lock()
+		local, exists := members[e.Addr]
+		if !exists || e.Incarnation > local.Incarnation {
+			// aggiornamento: nuovo peer / stato più recente
+			st := parseState(e.State)
+			members[e.Addr] = &Member{
+				Addr:        e.Addr,
+				State:       st,
+				Incarnation: e.Incarnation,
+				LastAck:     time.Unix(0, e.LastAck),
+				GraceHops:   e.GraceHops,
+			}
+			enqueue(Event{
+				Kind:        stateToEventKind(st),
+				Addr:        e.Addr,
+				Incarnation: e.Incarnation,
+				HopsLeft:    getHops(),
+			})
+		} else if local.Incarnation > e.Incarnation {
+			// ho io stato più nuovo → lo includo in risposta SYNC
+			toSync = append(toSync, MemberDigestEntry{
+				Addr:        local.Addr,
+				State:       local.State.String(),
+				Incarnation: local.Incarnation,
+				LastAck:     local.LastAck.UnixNano(),
+				GraceHops:   local.GraceHops,
+			})
+		}
+		memMu.Unlock()
+	}
+
+	// 2) Rispondi con un SYNC solo se hai delle entry da inviare
+	if len(toSync) > 0 {
+		resp := DigestMessage{Type: "SYNC", Entries: toSync}
+		data, err := json.Marshal(resp)
+		if err != nil {
+			log.Printf("[ANTI‑ENTROPY] marshal sync: %v", err)
+			return
+		}
+		if _, err := conn.WriteToUDP(data, src); err != nil {
+			log.Printf("[ANTI‑ENTROPY] send sync: %v", err)
+		}
+	}
+}
+
+func handleSync(dm DigestMessage) {
+	// 1) Applica esattamente la stessa reconciliation di handleDigest, senza rispondere
+	for _, e := range dm.Entries {
+		memMu.Lock()
+		local, exists := members[e.Addr]
+		if !exists || e.Incarnation > local.Incarnation {
+			st := parseState(e.State)
+			members[e.Addr] = &Member{
+				Addr:        e.Addr,
+				State:       st,
+				Incarnation: e.Incarnation,
+				LastAck:     time.Unix(0, e.LastAck),
+				GraceHops:   e.GraceHops,
+			}
+			enqueue(Event{
+				Kind:        stateToEventKind(st),
+				Addr:        e.Addr,
+				Incarnation: e.Incarnation,
+				HopsLeft:    getHops(),
+			})
+		}
+		memMu.Unlock()
+	}
+}
+
+// ——— 4) Helper per parse dello stato e mapping verso gli EventKind ———
+
+func parseState(s string) State {
+	switch s {
+	case "Alive":
+		return Alive
+	case "Suspect":
+		return Suspect
+	case "Dead":
+		return Dead
+	default:
+		return Alive
+	}
+}
+
+func stateToEventKind(st State) EventType {
+	switch st {
+	case Alive:
+		return EvAlive
+	case Suspect:
+		return EvSuspect
+	case Dead:
+		return EvDead
+	}
+	return EvAlive
+}
 
 func enqueue(e Event) {
 	evMu.Lock()
@@ -74,6 +233,20 @@ func listenGossipUDP(conn *net.UDPConn) {
 			log.Printf("[GOSSIP] read error: %v", err)
 			continue
 		}
+		data := buf[:n]
+		// 5.1) Provo a interpretarlo come JSON DIGEST/SYNC
+		var dm DigestMessage
+		if err := json.Unmarshal(data, &dm); err == nil {
+			switch dm.Type {
+			case "DIGEST":
+				handleDigest(src, dm, conn)
+				continue
+			case "SYNC":
+				handleSync(dm)
+				continue
+			}
+		}
+
 		for _, line := range strings.Split(string(buf[:n]), "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" {
@@ -452,26 +625,28 @@ func indirectPingUDP(proxy, target, origin string, timeout time.Duration) bool {
 		return false
 	}
 }
+
+// ——— 6) Nuovo loop anti‑entropy push‑pull ———
+
 func antiEntropyLoopUDP(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		// ——— 1) SELF‑HEARTBEAT ———
+		// 6.2) Push‑pull verso un peer casuale
+		peer := pickRandomPeer(selfAddr)
+		if peer != "" {
+			go sendDigest(peer)
+		} else {
+			return
+		}
+		// 6.1) Self‑heartbeat
 		memMu.Lock()
 		inc := members[selfAddr].Incarnation
 		memMu.Unlock()
-		enqueue(Event{
-			Kind:        EvAlive,
-			Addr:        selfAddr,
-			Incarnation: inc,
-			HopsLeft:    getHops(),
-		})
-		log.Printf("[ANTI‑ENTROPY] enqueued self‑heartbeat (inc=%d)", inc)
+		enqueue(Event{Kind: EvAlive, Addr: selfAddr, Incarnation: inc, HopsLeft: getHops()})
+		log.Printf("[ANTI‑ENTROPY] self‑heartbeat enqueued (inc=%d)", inc)
 
-		// ——— 2) FAN‑OUT GOSSIP PUSH ———
-		// Sfruttiamo gossipNowUDP che già sceglie K peer e chiama sendPiggybackUDP.
-		gossipNowUDP()
 	}
 }
 
@@ -507,53 +682,54 @@ func probeLoopUDP() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		// 1) pick a random ALIVE peer (excluding self)
-		target := pickRandomPeer(selfAddr)
-		if target == "" {
-			continue
-		}
-		log.Printf("[SWIM] probe → %s", target)
-		memMu.Lock()
-		for _, m := range members {
-			if m.GraceHops > 0 && m.Addr == target {
-				m.GraceHops--
-			}
-		}
-		memMu.Unlock()
-
-		// 2) direct PING
-		if directPingUDP(target, probeTimeout) {
-			recordAck(target) // got ACK → ALIVE
+		// A) scegli k peer da pingare
+		targets := chooseKRandomExcept([]string{selfAddr}, getFanout())
+		if len(targets) == 0 {
 			continue
 		}
 
-		// 3) no direct ACK → mark SUSPECT (skip if still in grace)
-		markSuspect(target)
-
-		// 4) send k PING‑REQ helpers
-		helpers := chooseKRandomExcept([]string{selfAddr, target}, getFanout())
-		gotAck := make(chan struct{}, 1)
-		for _, h := range helpers {
-			go func(proxy string) {
-				if indirectPingUDP(proxy, target, selfAddr, probeTimeout) {
-					gotAck <- struct{}{}
+		// B) PING diretti in parallelo
+		failed := make(chan string, len(targets))
+		var wg sync.WaitGroup
+		for _, t := range targets {
+			wg.Add(1)
+			go func(target string) {
+				defer wg.Done()
+				if directPingUDP(target, probeTimeout) {
+					recordAck(target) // è vivo
+				} else {
+					failed <- target // niente ACK diretto
 				}
-			}(h)
+			}(t)
 		}
+		wg.Wait()
+		close(failed)
 
-		// 5) wait for an indirect ACK
-		select {
-		case <-gotAck:
-			log.Printf("[SWIM] indirect ACK from %s via helper", target)
-			recordAck(target)
-		case <-time.After(probeTimeout):
-			memMu.Lock()
-			state := members[target].State
-			memMu.Unlock()
-			if state == Suspect {
-				log.Printf("[SWIM] no ACK (direct+indirect) for %s, remains SUSPECT", target)
+		// C) Per ogni peer che NON ha risposto: PING‑REQ
+		for target := range failed {
+			helpers := chooseKRandomExcept([]string{selfAddr, target}, getFanout())
+
+			// se non ci sono helper possibili, ci arrendiamo subito:
+			if len(helpers) == 0 {
+				markSuspect(target)
+				continue
 			}
-			// STRICT‑SWIM: do *not* mark DEAD here.
+
+			gotAck := make(chan struct{}, 1)
+			for _, h := range helpers {
+				go func(proxy string) {
+					if indirectPingUDP(proxy, target, selfAddr, probeTimeout) {
+						gotAck <- struct{}{}
+					}
+				}(h)
+			}
+
+			select {
+			case <-gotAck:
+				recordAck(target) // ack indiretto → ALIVE
+			case <-time.After(probeTimeout):
+				markSuspect(target) // fallito anche l’indiretto
+			}
 		}
 	}
 }
@@ -656,91 +832,6 @@ func recordAck(addr string) {
 	memMu.Unlock()
 }
 
-// sendPiggybackUDP invia in UDP fino a maxPiggybackEntries eventi in coda (eventQ) a dst
-func sendPiggybackUDP(conn *net.UDPConn, dst *net.UDPAddr) {
-	evMu.Lock()
-	defer evMu.Unlock()
-
-	if len(eventQ) == 0 {
-		return
-	}
-
-	// 1) Suddividi in tre bucket in base alla priorità
-	var crit, joins, alives []Event
-	for _, e := range eventQ {
-		switch e.Kind {
-		case EvSuspect, EvDead, EvLeave:
-			crit = append(crit, e)
-		case EvJoin:
-			joins = append(joins, e)
-		case EvAlive:
-			alives = append(alives, e)
-		}
-	}
-
-	// 2) Scegli fino a maxPiggybackEntries seguendo la priorità
-	toSend := make([]Event, 0, maxPiggybackEntries)
-	pick := func(list []Event) {
-		for _, e := range list {
-			if len(toSend) >= maxPiggybackEntries {
-				return
-			}
-			toSend = append(toSend, e)
-		}
-	}
-	pick(crit)
-	pick(joins)
-	pick(alives)
-
-	// 3) Log di quanti ne andremo a inviare
-	log.Printf("[GOSSIP] piggyback: invio %d/%d eventi (crit=%d, join=%d, alive=%d)",
-		len(toSend), len(eventQ), len(crit), len(joins), len(alives))
-
-	// 4) Costruisci il payload
-	var buf bytes.Buffer
-	nextQ := make([]Event, 0, len(eventQ))
-	sendSet := make(map[int]struct{}, len(toSend))
-	for i, e := range toSend {
-		sendSet[i] = struct{}{} // marcatore per decrement hops
-		switch e.Kind {
-		case EvJoin:
-			buf.WriteString(fmt.Sprintf("JOIN %s\n", e.Addr))
-		case EvAlive:
-			gh := members[e.Addr].GraceHops
-			buf.WriteString(fmt.Sprintf("ALIVE %s %d %d\n", e.Addr, e.Incarnation, gh))
-		case EvLeave:
-			// due campi, senza incarnation
-			buf.WriteString(fmt.Sprintf("LEAVE %s\n", e.Addr))
-		default: // EvSuspect, EvDead
-			buf.WriteString(fmt.Sprintf("%s %s %d\n", e.Kind, e.Addr, e.Incarnation))
-		}
-	}
-
-	// 5) Ricostruisci la coda con gli eventi non ancora scaduti (hopsLeft>0)
-	for _, e := range eventQ {
-		e.HopsLeft--
-		if e.HopsLeft > 0 {
-			nextQ = append(nextQ, e)
-		}
-	}
-	eventQ = nextQ
-
-	// 6) Invio effettivo
-	if buf.Len() > 0 {
-		if conn.RemoteAddr() != nil {
-			_, err := conn.Write(buf.Bytes())
-			if err != nil {
-				log.Printf("[GOSSIP] piggyback write error: %v", err)
-			}
-		} else {
-			_, err := conn.WriteToUDP(buf.Bytes(), dst)
-			if err != nil {
-				log.Printf("[GOSSIP] piggyback write error: %v", err)
-			}
-		}
-	}
-}
-
 func getFanout() int {
 	memMu.Lock()
 	var peers []string
@@ -758,6 +849,22 @@ func getFanout() int {
 	return fanout
 }
 
+// allAlivePeers restituisce la lista di tutti i peer attualmente in stato ALIVE
+// (escludendo se stesso).  La slice ritornata è una *copia*, quindi chi la
+// usa può modificarla senza correre il rischio di data‑race.
+func allAlivePeers() []string {
+	memMu.Lock()
+	defer memMu.Unlock()
+
+	peers := make([]string, 0, len(members))
+	for addr, m := range members {
+		if m.State == Alive && addr != selfAddr {
+			peers = append(peers, addr)
+		}
+	}
+	return peers
+}
+
 // -----------------------------------------------------------------
 // 3) Tornata attiva di gossip: seleziona fanout peer e invia piggyback
 // -----------------------------------------------------------------
@@ -765,7 +872,7 @@ func gossipNowUDP() {
 	// fanout = ceil(log2(N+1))
 	fanout := getFanout()
 	// scegli k peer Alive (escludendo self) usando la stessa utilità
-	targets := chooseKRandomExcept([]string{selfAddr}, fanout)
+	targets := chooseKRandomExcept(allAlivePeers(), fanout)
 	for _, addr := range targets {
 		go func(a string) {
 			udpAddr, err := net.ResolveUDPAddr("udp", a)
@@ -796,18 +903,6 @@ func diffuseJoin(selfAddr string) {
 	eventQ = append(eventQ, e)
 	evMu.Unlock()
 	go gossipNowUDP()
-}
-
-func alreadySeen(e Event) bool {
-	k := fmt.Sprintf("%d|%s", e.Kind, e.Addr)
-	seenMu.Lock()
-	defer seenMu.Unlock()
-	old, exists := seen[k]
-	if exists && e.Incarnation <= old {
-		return true
-	}
-	seen[k] = e.Incarnation
-	return false
 }
 
 // voluntaryLeave inietta un leave nel gossip e poi notifica il registry.

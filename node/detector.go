@@ -151,31 +151,43 @@ func pickRandomPeer(me string) string {
 	return list[rand.Intn(len(list))]
 }
 
-func chooseKRandomExcept(exclude []string, k int) []string {
-	ex := map[string]struct{}{}
-	for _, e := range exclude {
-		ex[e] = struct{}{}
+// scegli fino a k peer ALIVE, escludendo quelli passati in `except`.
+func chooseKRandomExcept(except []string, k int) []string {
+	// costruisco un set O(1) per i peer da escludere
+	skip := make(map[string]struct{}, len(except))
+	for _, addr := range except {
+		skip[addr] = struct{}{}
 	}
 
-	memMu.Lock()
-	defer memMu.Unlock()
+	// ottengo i candidati (solo ALIVE) – slice già separata e thread‑safe
+	candidates := allAlivePeers()
 
-	var pool []string
-	for addr, m := range members {
-		if _, skip := ex[addr]; skip {
-			continue
+	// filtro i candidati da escludere
+	kept := candidates[:0] // reuse della stessa slice
+	for _, addr := range candidates {
+		if _, found := skip[addr]; !found {
+			kept = append(kept, addr)
 		}
-		if m.State != Alive {
-			continue
-		} // <-- salta SUSPECT/DEAD
-		pool = append(pool, addr)
 	}
 
-	rand.Shuffle(len(pool), func(i, j int) { pool[i], pool[j] = pool[j], pool[i] })
-	if len(pool) < k {
-		k = len(pool)
+	// niente da scegliere?
+	if len(kept) == 0 || k <= 0 {
+		return nil
 	}
-	return pool[:k]
+
+	// mescola in modo pseudo‑random
+	// (se non hai già seedato altrove, fallo una tantum nel tuo main)
+	rand.Seed(time.Now().UnixNano())
+	rand.Shuffle(len(kept), func(i, j int) { kept[i], kept[j] = kept[j], kept[i] })
+
+	// restituisci al massimo k elementi
+	if len(kept) > k {
+		kept = kept[:k]
+	}
+	// slice di ritorno indipendente
+	out := make([]string, len(kept))
+	copy(out, kept)
+	return out
 }
 
 // -------------------------------------------------------------
