@@ -12,6 +12,10 @@
 **/*.exe
 **/*.dbmdl
 **/*.jfm
+.git
+node/vendor
+registry/vendor
+**/*.log
 **/charts
 **/docker-compose*
 **/compose*

@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/google/uuid"
 	"log"
 	"math"
 	"net"
@@ -13,12 +12,10 @@ import (
 )
 
 const (
-	probePeriod    = 1*time.Second + 500*time.Millisecond
-	probeTimeout   = 1*time.Second + 100*time.Millisecond
-	suspectTimeout = 8 * time.Second
-	dumpInterval   = 10 * time.Second
-	// gossip.go (o swim.go)
-	maxPiggybackEntries = 128
+	probePeriod    = 5 * time.Second
+	probeTimeout   = 5 * time.Second
+	suspectTimeout = 10 * time.Second
+	dumpInterval   = 5 * time.Second
 )
 
 type MemberDigestEntry struct {
@@ -72,83 +69,6 @@ func sendDigest(peer string) {
 
 	if _, err := conn.Write(data); err != nil {
 		log.Printf("[ANTI‑ENTROPY] send digest to %s: %v", peer, err)
-	}
-}
-
-// ——— 3) Gestione in ingresso di DIGEST e SYNC ———
-
-func handleDigest(src *net.UDPAddr, dm DigestMessage, conn *net.UDPConn) {
-	var toSync []MemberDigestEntry
-
-	// 1) Reconciliation: per ogni entry in dm, confronta con local members
-	for _, e := range dm.Entries {
-		memMu.Lock()
-		local, exists := members[e.Addr]
-		if !exists || e.Incarnation > local.Incarnation {
-			// aggiornamento: nuovo peer / stato più recente
-			st := parseState(e.State)
-			members[e.Addr] = &Member{
-				Addr:        e.Addr,
-				State:       st,
-				Incarnation: e.Incarnation,
-				LastAck:     time.Unix(0, e.LastAck),
-				GraceHops:   e.GraceHops,
-			}
-			enqueue(Event{
-				Kind:        stateToEventKind(st),
-				Addr:        e.Addr,
-				Incarnation: e.Incarnation,
-				HopsLeft:    getHops(),
-			})
-		} else if local.Incarnation > e.Incarnation {
-			// ho io stato più nuovo → lo includo in risposta SYNC
-			toSync = append(toSync, MemberDigestEntry{
-				Addr:        local.Addr,
-				State:       local.State.String(),
-				Incarnation: local.Incarnation,
-				LastAck:     local.LastAck.UnixNano(),
-				GraceHops:   local.GraceHops,
-			})
-		}
-		memMu.Unlock()
-	}
-
-	// 2) Rispondi con un SYNC solo se hai delle entry da inviare
-	if len(toSync) > 0 {
-		resp := DigestMessage{Type: "SYNC", Entries: toSync}
-		data, err := json.Marshal(resp)
-		if err != nil {
-			log.Printf("[ANTI‑ENTROPY] marshal sync: %v", err)
-			return
-		}
-		if _, err := conn.WriteToUDP(data, src); err != nil {
-			log.Printf("[ANTI‑ENTROPY] send sync: %v", err)
-		}
-	}
-}
-
-func handleSync(dm DigestMessage) {
-	// 1) Applica esattamente la stessa reconciliation di handleDigest, senza rispondere
-	for _, e := range dm.Entries {
-		memMu.Lock()
-		local, exists := members[e.Addr]
-		if !exists || e.Incarnation > local.Incarnation {
-			st := parseState(e.State)
-			members[e.Addr] = &Member{
-				Addr:        e.Addr,
-				State:       st,
-				Incarnation: e.Incarnation,
-				LastAck:     time.Unix(0, e.LastAck),
-				GraceHops:   e.GraceHops,
-			}
-			enqueue(Event{
-				Kind:        stateToEventKind(st),
-				Addr:        e.Addr,
-				Incarnation: e.Incarnation,
-				HopsLeft:    getHops(),
-			})
-		}
-		memMu.Unlock()
 	}
 }
 
@@ -232,19 +152,6 @@ func listenGossipUDP(conn *net.UDPConn) {
 		if err != nil {
 			log.Printf("[GOSSIP] read error: %v", err)
 			continue
-		}
-		data := buf[:n]
-		// 5.1) Provo a interpretarlo come JSON DIGEST/SYNC
-		var dm DigestMessage
-		if err := json.Unmarshal(data, &dm); err == nil {
-			switch dm.Type {
-			case "DIGEST":
-				handleDigest(src, dm, conn)
-				continue
-			case "SYNC":
-				handleSync(dm)
-				continue
-			}
 		}
 
 		for _, line := range strings.Split(string(buf[:n]), "\n") {
@@ -550,7 +457,7 @@ func listenGossipUDP(conn *net.UDPConn) {
 func pingPeerUDP(peer string, timeout time.Duration) bool {
 	// 1) prepara canale e UUID
 	ch := make(chan struct{})
-	id := uuid.New().String()
+	id := ackCount + 1
 	ackWaiters.Store(id, ch)
 	defer ackWaiters.Delete(id)
 
@@ -598,7 +505,7 @@ func directPingUDP(target string, timeout time.Duration) bool {
 // indirectPingUDP invia PING-REQ a proxy per target→origin
 func indirectPingUDP(proxy, target, origin string, timeout time.Duration) bool {
 	ch := make(chan struct{})
-	id := uuid.New().String()
+	id := ackCount + 1
 	ackWaiters.Store(id, ch)
 	defer ackWaiters.Delete(id)
 
@@ -627,28 +534,6 @@ func indirectPingUDP(proxy, target, origin string, timeout time.Duration) bool {
 }
 
 // ——— 6) Nuovo loop anti‑entropy push‑pull ———
-
-func antiEntropyLoopUDP(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		// 6.2) Push‑pull verso un peer casuale
-		peer := pickRandomPeer(selfAddr)
-		if peer != "" {
-			go sendDigest(peer)
-		} else {
-			return
-		}
-		// 6.1) Self‑heartbeat
-		memMu.Lock()
-		inc := members[selfAddr].Incarnation
-		memMu.Unlock()
-		enqueue(Event{Kind: EvAlive, Addr: selfAddr, Incarnation: inc, HopsLeft: getHops()})
-		log.Printf("[ANTI‑ENTROPY] self‑heartbeat enqueued (inc=%d)", inc)
-
-	}
-}
 
 // markDead marca il peer addr come DEAD e innesca side‐effect
 func markDead(addr string) {
