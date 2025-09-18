@@ -1,0 +1,97 @@
+version: "3.9"
+services:
+  node1:
+    build: .
+    container_name: node1
+    environment:
+      - SELF_ID=node1
+      - SELF_ADDR=node1:9000
+      - SEEDS=node2:9001,node3:9002
+      - GOSSIP_INTERVAL=700ms
+      - HEARTBEAT_INTERVAL=500ms
+      - SUSPECT_TIMEOUT=2500ms
+      - DEAD_TIMEOUT=6000ms
+      - FANOUT_K=2
+      - MAX_DIGEST=64
+      # service discovery
+      - API_PORT=8080
+      - SERVICES=calc
+      - CALC_PORT=18080
+      - SERVICE_TTL=15
+      - MAX_SERVICE_DIGEST=64
+    ports:
+      - "9000:9000/udp"
+      - "8080:8080"      # discovery API
+      - "18080:18080"    # calc
+  node2:
+    build: .
+    container_name: node2
+    environment:
+      - SELF_ID=node2
+      - SELF_ADDR=node2:9001
+      - SEEDS=node1:9000,node3:9002
+      - GOSSIP_INTERVAL=700ms
+      - HEARTBEAT_INTERVAL=500ms
+      - SUSPECT_TIMEOUT=2500ms
+      - DEAD_TIMEOUT=6000ms
+      - FANOUT_K=2
+      - MAX_DIGEST=64
+      - API_PORT=8081
+      - SERVICES=calc
+      - CALC_PORT=18081
+      - SERVICE_TTL=15
+      - MAX_SERVICE_DIGEST=64
+    ports:
+      - "9001:9001/udp"
+      - "8081:8081"
+      - "18081:18081"
+  node3:
+    build: .
+    container_name: node3
+    environment:
+      - SELF_ID=node3
+      - SELF_ADDR=node3:9002
+      - SEEDS=node1:9000,node2:9001
+      - GOSSIP_INTERVAL=700ms
+      - HEARTBEAT_INTERVAL=500ms
+      - SUSPECT_TIMEOUT=2500ms
+      - DEAD_TIMEOUT=6000ms
+      - FANOUT_K=2
+      - MAX_DIGEST=64
+      - API_PORT=8082
+      - SERVICES=           # nessun servizio (vuoto)
+      - SERVICE_TTL=15
+      - MAX_SERVICE_DIGEST=64
+    ports:
+      - "9002:9002/udp"
+      - "8082:8082"
+  orchestrator:
+    build:
+      context: ./orchestrator
+    container_name: orchestrator
+    environment:
+      # indirizzi delle API discovery interne alla rete Docker
+      - DISCOVERY_NODES=node1:8080,node2:8081,node3:8082
+      - SERVICE=calc
+      - INTERVAL=5             # ogni 5 secondi
+      - JITTER_MS=500          # jitter per non sincronizzare i client
+      - OPS=sum,sub
+      - A_MIN=0
+      - A_MAX=50
+      - B_MIN=0
+      - B_MAX=50
+      - STARTUP_WAIT=8
+      - STOP_INTERVAL=30       # fermare i nodi dopo 30s
+      - START_INTERVAL=15      # riavviare i nodi dopo 15s
+      - NODES_TO_STOP=node2   # nodo da fermare (puoi aggiungere più nodi)
+    depends_on:
+      - node1
+      - node2
+      - node3
+    restart: unless-stopped
+
+
+
+networks:
+  default:
+    name: gossip-net

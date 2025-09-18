@@ -1,6 +1,6 @@
 **/.classpath
 **/.dockerignore
-.env
+gossip-fd/.env
 **/.git
 **/.gitignore
 **/.project
