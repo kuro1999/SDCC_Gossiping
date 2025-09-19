@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -188,7 +189,6 @@ func NewNode() (*Node, error) {
 		HeartbeatInterval: parseDurationEnv("HEARTBEAT_INTERVAL", 500*time.Millisecond),
 		SuspectTimeout:    parseDurationEnv("SUSPECT_TIMEOUT", 2500*time.Millisecond),
 		DeadTimeout:       parseDurationEnv("DEAD_TIMEOUT", 6000*time.Millisecond),
-		FanoutK:           parseIntEnv("FANOUT_K", 2),
 		MaxDigestPeers:    parseIntEnv("MAX_DIGEST", 64),
 		APIPort:           parseIntEnv("API_PORT", 8080),
 		ServicesCSV:       mustEnv("SERVICES", ""),
@@ -323,11 +323,24 @@ func (n *Node) gossipLoop() {
 	t := time.NewTicker(n.cfg.GossipInterval)
 	defer t.Stop()
 	for range t.C {
-		targets := n.pickRandomTargets(n.cfg.FanoutK)
+		// Calcola il fanout dinamico
+		fanoutK := n.calculateDynamicFanout()
+
+		// Se il fanoutK è zero, non inviare messaggi
+		if fanoutK == 0 {
+			continue
+		}
+
+		// Seleziona i nodi target in base al fanout dinamico
+		targets := n.pickRandomTargets(fanoutK)
 		if len(targets) == 0 {
 			continue
 		}
+
+		// Costruisci il messaggio da inviare
 		msg := n.buildMessage(false /* isReply */)
+
+		// Invia i messaggi ai nodi target in modo concorrente
 		for _, peer := range targets {
 			go func(p *Member) {
 				if err := n.sendTo(p.Addr, msg); err != nil {
@@ -744,10 +757,36 @@ func readAB(r *http.Request) (int, int, error) {
 
 // ---------------- Peer selection & view ----------------
 
+func (n *Node) calculateDynamicFanout() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// Calcola il numero di nodi ALIVE
+	aliveCount := 0
+	for _, m := range n.members {
+		if m.State == StateAlive {
+			aliveCount++
+		}
+	}
+
+	// Usa una costante per controllare la crescita (puoi fare delle prove per trovare un valore ottimale)
+	if aliveCount <= 1 {
+		return 1 // se c'è un solo nodo, fanout è 1
+	}
+
+	// Calcolo del fanout con scala logaritmica
+	fanout := int(math.Log2(float64(aliveCount))) + 1
+	if fanout < 1 {
+		fanout = 1
+	}
+	return fanout
+}
+
 func (n *Node) pickRandomTargets(k int) []*Member {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	// Crea una lista di nodi ALIVE e SUSPECT
 	peers := make([]*Member, 0, len(n.members))
 	for id, m := range n.members {
 		if id == n.cfg.SelfID {
@@ -757,14 +796,22 @@ func (n *Node) pickRandomTargets(k int) []*Member {
 			peers = append(peers, m)
 		}
 	}
+
+	// Se non ci sono peer disponibili, ritorna nil
 	if len(peers) == 0 {
 		return nil
 	}
-	rand.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
-	if len(peers) > k {
-		peers = peers[:k]
+
+	// Se il numero di peer è inferiore al fanoutK, ritorna tutti i peer
+	if len(peers) <= k {
+		return peers
 	}
-	return peers
+
+	// Se ci sono più peer di quelli che possiamo inviare, randomizza la selezione
+	rand.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
+
+	// Ritorna solo i primi 'k' peer
+	return peers[:k]
 }
 
 func (n *Node) printView() {
