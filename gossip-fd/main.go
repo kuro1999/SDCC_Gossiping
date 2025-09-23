@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -31,6 +32,29 @@ import (
 
   - Demo service: "calc" HTTP con /sum e /sub opzionali per la prova end-to-end.
 */
+// ===== EXPERIMENT TOGGLES (cambia solo qui tra le run) =====
+const (
+	EnablePeriodicGossip = true  // RUN A: solo periodico -> true; RUN B: true
+	EnableEventGossip    = false // RUN A: false (solo periodico); RUN B: true (periodico + eventi)
+)
+
+type svcRegisterReq struct {
+	Service    string `json:"service"`
+	InstanceID string `json:"instance_id"`
+	Addr       string `json:"addr"`
+	TTL        int    `json:"ttl_seconds"`
+}
+
+type svcDeregisterReq struct {
+	Service    string `json:"service"`
+	InstanceID string `json:"instance_id"`
+}
+
+// metriche semplici
+type Metrics struct {
+	periodic uint64 // # invii periodici
+	event    uint64 // # invii da evento
+}
 
 type MemberState string
 
@@ -129,6 +153,11 @@ type Node struct {
 	services map[string]*ServiceInstance // key = svcKey
 	selfHB   uint64
 	udpPort  int
+	//struct eventi
+	eventCh chan struct{}
+	//metriche
+	metricPeriodic uint64 // # batch gossip inviati per motivo "periodic"
+	metricEvent    uint64 // # batch gossip inviati per motivo "event"
 }
 
 // ---------------- Utilità env ----------------
@@ -210,6 +239,9 @@ func NewNode() (*Node, error) {
 		services: make(map[string]*ServiceInstance),
 		udpPort:  port,
 	}
+	if EnableEventGossip {
+		n.eventCh = make(chan struct{}, 64) // BUFFERIZZATO: evita blocchi
+	}
 
 	now := time.Now()
 	n.members[id] = &Member{
@@ -259,7 +291,8 @@ func (n *Node) run() {
 
 	// refresh/TTL per servizi locali
 	go n.serviceRefreshLoop()
-
+	// --- avvio metriche ---
+	go n.metricsLoop()
 	// stampa periodica view
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
@@ -287,8 +320,23 @@ func (n *Node) heartbeatLoop() {
 func (n *Node) suspicionLoop() {
 	t := time.NewTicker(500 * time.Millisecond)
 	defer t.Stop()
+
 	for range t.C {
 		now := time.Now()
+
+		// raccolgo le transizioni e quante volte devo triggerare eventi,
+		// ma SENZA fare I/O o send sul canale sotto lock
+		type tr struct {
+			old      MemberState
+			new      MemberState
+			id       string
+			lastSeen time.Time
+			delta    time.Duration
+		}
+		var transitions []tr
+		deadTriggers := 0
+
+		// --- sezione critica minima ---
 		n.mu.Lock()
 		for id, m := range n.members {
 			if id == n.cfg.SelfID || m.State == StateDead {
@@ -297,57 +345,173 @@ func (n *Node) suspicionLoop() {
 			if m.LastSeen.IsZero() {
 				continue
 			}
+
 			d := now.Sub(m.LastSeen)
 			old := m.State
+			newSt := old
+
 			if d > n.cfg.DeadTimeout {
-				m.State = StateDead
+				newSt = StateDead
 			} else if d > n.cfg.SuspectTimeout {
-				m.State = StateSuspect
+				newSt = StateSuspect
 			} else {
-				m.State = StateAlive
+				newSt = StateAlive
 			}
-			if m.State != old {
-				log.Printf("[STATE] %s -> %s (peer=%s, lastSeen=%s, Δ=%s)",
-					old, m.State, id, m.LastSeen.Format(time.RFC3339), d.Truncate(time.Millisecond))
+
+			if newSt != old {
+				m.State = newSt
+				transitions = append(transitions, tr{
+					old: old, new: newSt, id: id, lastSeen: m.LastSeen, delta: d,
+				})
+				if newSt == StateDead {
+					deadTriggers++
+				}
 			}
 		}
 		n.mu.Unlock()
-		// scadenze di servizi remoti (TTL)
+		// --- fine sezione critica ---
+
+		// logging delle transizioni (fuori dal lock)
+		for _, x := range transitions {
+			log.Printf("[STATE] %s -> %s (peer=%s, lastSeen=%s, Δ=%s)",
+				x.old, x.new, x.id, x.lastSeen.Format(time.RFC3339), x.delta.Truncate(time.Millisecond))
+			if x.new == StateDead {
+				log.Printf("[EVENTO] Nodo %s è diventato DEAD. Scatenato gossip immediato.", x.id)
+			}
+		}
+
+		// trigger degli eventi (una volta per ogni passaggio a DEAD, come prima)
+		for i := 0; i < deadTriggers; i++ {
+			n.onEventTrigger()
+		}
+
+		// scadenze servizi (fa lock all’interno, ma qui siamo fuori dalla nostra sezione critica)
 		n.pruneExpiredServices()
 	}
 }
 
+// Canale per eventi che triggerano un gossip immediato
+// Canale per eventi che triggerano un gossip immediato
+func (n *Node) onEventTrigger() {
+	if !EnableEventGossip || n.eventCh == nil {
+		return
+	}
+	select {
+	case n.eventCh <- struct{}{}:
+	default: // coalesce se pieno, niente blocco
+	}
+}
+
 // ---------------- Gossip send/recv ----------------
+func (n *Node) metricsLoop() {
+	t := time.NewTicker(10 * time.Second)
+	defer t.Stop()
+
+	for range t.C {
+		p := atomic.LoadUint64(&n.metricPeriodic)
+		e := atomic.LoadUint64(&n.metricEvent)
+		log.Printf("[METRICS] gossip_batches periodic=%d event=%d", p, e)
+	}
+}
 
 func (n *Node) gossipLoop() {
 	t := time.NewTicker(n.cfg.GossipInterval)
 	defer t.Stop()
-	for range t.C {
-		// Calcola il fanout dinamico
-		fanoutK := n.calculateDynamicFanout()
 
-		// Se il fanoutK è zero, non inviare messaggi
-		if fanoutK == 0 {
-			continue
-		}
+	for {
+		select {
+		case <-t.C:
+			n.sendGossip("periodic")
 
-		// Seleziona i nodi target in base al fanout dinamico
-		targets := n.pickRandomTargets(fanoutK)
-		if len(targets) == 0 {
-			continue
-		}
-
-		// Costruisci il messaggio da inviare
-		msg := n.buildMessage(false /* isReply */)
-
-		// Invia i messaggi ai nodi target in modo concorrente
-		for _, peer := range targets {
-			go func(p *Member) {
-				if err := n.sendTo(p.Addr, msg); err != nil {
-					log.Printf("[SEND-ERR] to %s: %v", p.Addr, err)
+		case <-n.eventCh:
+			// Coalesce di eventuali ulteriori trigger arrivati quasi insieme
+			drained := 0
+			for drained < 32 { // limite di sicurezza per non loopare infinito
+				select {
+				case <-n.eventCh:
+					drained++
+				default:
+					drained = 32 // esci
 				}
-			}(peer)
+			}
+			n.sendGossip("event")
 		}
+	}
+}
+
+// Funzione che invia gossip periodico
+func (n *Node) sendGossip(origin string) {
+	// normalizza il tag di origine per i log
+	if origin == "" {
+		origin = "unknown"
+	}
+
+	switch origin {
+	case "periodic":
+		atomic.AddUint64(&n.metricPeriodic, 1)
+	case "event":
+		atomic.AddUint64(&n.metricEvent, 1)
+	}
+
+	// 1) Calcolo fanout dinamico
+	fanoutK := n.calculateDynamicFanout()
+	if fanoutK <= 0 {
+		return // niente log rumoroso se non inviamo
+	}
+
+	// 2) Scelta target
+	targets := n.pickRandomTargets(fanoutK)
+	if len(targets) == 0 {
+		return
+	}
+
+	// 3) Costruzione messaggio (una volta sola)
+	msg := n.buildMessage(false)
+
+	// 4) Logging essenziale del batch PRIMA dell’invio
+	log.Printf("[GOSSIP][%s] send fanout=%d targets=%d", origin, fanoutK, len(targets))
+
+	// 5) Invio concorrente (fire-and-forget), con cattura sicura dei parametri
+	for _, peer := range targets {
+		addr := peer.Addr // copia locale per evitare la cattura del puntatore
+		go func(a string) {
+			// difesa extra: non lasciare che un panic in un goroutine uccida il processo
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[GOSSIP][%s] panic while sending to %s: %v", origin, a, r)
+				}
+			}()
+			if err := n.sendTo(a, msg); err != nil {
+				log.Printf("[GOSSIP][%s] send-err addr=%s err=%v", origin, a, err)
+			}
+		}(addr)
+	}
+}
+
+// Funzione che invia il gossip immediato quando si verifica un evento critico
+func (n *Node) sendImmediateGossip() {
+	log.Println("[GOSSIP IMMEDIATO] Gossip inviato immediatamente a causa di un evento critico.")
+
+	// Calcola il fanout dinamico
+	fanoutK := n.calculateDynamicFanout()
+
+	// Seleziona i nodi target in base al fanout dinamico
+	targets := n.pickRandomTargets(fanoutK)
+	if len(targets) == 0 {
+		log.Println("[GOSSIP IMMEDIATO] Nessun nodo disponibile per inviare gossip.")
+		return
+	}
+
+	// Costruisci il messaggio da inviare
+	msg := n.buildMessage(false /* isReply */)
+
+	// Invia i messaggi ai nodi target in modo concorrente
+	for _, peer := range targets {
+		go func(p *Member) {
+			if err := n.sendTo(p.Addr, msg); err != nil {
+				log.Printf("[SEND-ERR] to %s: %v", p.Addr, err)
+			}
+		}(peer)
 	}
 }
 
@@ -450,7 +614,7 @@ func (n *Node) receiveLoop() {
 		}
 
 		if mu+su > 0 {
-			log.Printf("[MERGE] da=%s, membri=%d, servizi=%d", gm.FromID, mu, su)
+			//log.Printf("[MERGE] da=%s, membri=%d, servizi=%d", gm.FromID, mu, su)
 		}
 	}
 }
@@ -460,9 +624,12 @@ func (n *Node) receiveLoop() {
 func (n *Node) mergeMembership(gm *GossipMessage) int {
 	now := time.Now()
 	updated := 0
-
+	//log.Println("[SYNC] Acquisizione del mutex per merge dei membri")
 	n.mu.Lock()
-	defer n.mu.Unlock()
+	defer func() {
+		n.mu.Unlock()
+		//log.Println("[SYNC] Mutex rilasciato dopo merge dei membri")
+	}()
 
 	if gm.FromID != "" {
 		if _, ok := n.members[gm.FromID]; !ok {
@@ -473,6 +640,7 @@ func (n *Node) mergeMembership(gm *GossipMessage) int {
 				LastSeen: now,
 			}
 			updated++
+			log.Printf("[MERGE] Nuovo membro aggiunto: %s", gm.FromID)
 		}
 	}
 
@@ -482,6 +650,7 @@ func (n *Node) mergeMembership(gm *GossipMessage) int {
 			m = &Member{ID: s.ID, Addr: s.Addr}
 			n.members[s.ID] = m
 			updated++
+			log.Printf("[MERGE] Nuovo membro aggiunto: %s", s.ID)
 		}
 		if s.Heartbeat > m.Heartbeat {
 			old := m.State
@@ -768,17 +937,11 @@ func (n *Node) calculateDynamicFanout() int {
 			aliveCount++
 		}
 	}
-
-	// Usa una costante per controllare la crescita (puoi fare delle prove per trovare un valore ottimale)
 	if aliveCount <= 1 {
 		return 1 // se c'è un solo nodo, fanout è 1
 	}
-
 	// Calcolo del fanout con scala logaritmica
 	fanout := int(math.Log2(float64(aliveCount))) + 1
-	if fanout < 1 {
-		fanout = 1
-	}
 	return fanout
 }
 
@@ -854,6 +1017,13 @@ func (n *Node) printView() {
 		age := time.Since(sr.S.LastUpdated).Truncate(time.Millisecond)
 		log.Printf("  [SVC] %-18s id=%-14s up=%-5v ver=%-3d ttl=%-2ds age=%-8s addr=%s node=%s",
 			sr.S.Service, sr.S.InstanceID, sr.S.Up, sr.S.Version, sr.S.TTLSeconds, age, sr.S.Addr, sr.S.NodeID)
+	}
+}
+
+// opzionale: scateno subito un giro di gossip per diffondere il cambio servizio
+func (n *Node) triggerGossipForServiceChange() {
+	if EnableEventGossip {
+		n.onEventTrigger()
 	}
 }
 
