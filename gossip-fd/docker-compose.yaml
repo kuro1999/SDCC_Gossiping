@@ -7,13 +7,13 @@ services:
       - SELF_ID=node1
       - SELF_ADDR=node1:9000
       - SEEDS=node2:9001,node3:9002,node4:9003,node5:9004,node6:9005,node7:9006
-      - GOSSIP_INTERVAL=700ms
-      - HEARTBEAT_INTERVAL=500ms
-      - SUSPECT_TIMEOUT=2500ms
-      - DEAD_TIMEOUT=6000ms
+      - GOSSIP_INTERVAL=1400ms
+      - HEARTBEAT_INTERVAL=1000ms
+      - SUSPECT_TIMEOUT=5000ms
+      - DEAD_TIMEOUT=12000ms
       # service discovery
       - API_PORT=8080
-      - SERVICES=calc
+      - SERVICES=
       - CALC_PORT=18080
       - SERVICE_TTL=15
       - MAX_SERVICE_DIGEST=64
@@ -29,12 +29,12 @@ services:
       - SELF_ID=node2
       - SELF_ADDR=node2:9001
       - SEEDS=node1:9000,node3:9002,node4:9003,node5:9004,node6:9005,node7:9006
-      - GOSSIP_INTERVAL=700ms
-      - HEARTBEAT_INTERVAL=500ms
-      - SUSPECT_TIMEOUT=2500ms
-      - DEAD_TIMEOUT=6000ms
+      - GOSSIP_INTERVAL=1400ms
+      - HEARTBEAT_INTERVAL=1000ms
+      - SUSPECT_TIMEOUT=5000ms
+      - DEAD_TIMEOUT=12000ms
       - API_PORT=8081
-      - SERVICES=calc
+      - SERVICES=
       - CALC_PORT=18081
       - SERVICE_TTL=15
       - MAX_SERVICE_DIGEST=64
@@ -50,12 +50,12 @@ services:
       - SELF_ID=node3
       - SELF_ADDR=node3:9002
       - SEEDS=node1:9000,node2:9001,node4:9003,node5:9004,node6:9005,node7:9006
-      - GOSSIP_INTERVAL=700ms
-      - HEARTBEAT_INTERVAL=500ms
-      - SUSPECT_TIMEOUT=2500ms
-      - DEAD_TIMEOUT=6000ms
+      - GOSSIP_INTERVAL=1400ms
+      - HEARTBEAT_INTERVAL=1000ms
+      - SUSPECT_TIMEOUT=5000ms
+      - DEAD_TIMEOUT=12000ms
       - API_PORT=8082
-      - SERVICES=           # nessun servizio (vuoto)
+      - SERVICES=calc           # nessun servizio (vuoto)
       - SERVICE_TTL=15
       - MAX_SERVICE_DIGEST=64
     ports:
@@ -69,10 +69,10 @@ services:
       - SELF_ID=node4
       - SELF_ADDR=node4:9003
       - SEEDS=node1:9000,node2:9001,node3:9002,node5:9004,node6:9005,node7:9006
-      - GOSSIP_INTERVAL=700ms
-      - HEARTBEAT_INTERVAL=500ms
-      - SUSPECT_TIMEOUT=2500ms
-      - DEAD_TIMEOUT=6000ms
+      - GOSSIP_INTERVAL=1400ms
+      - HEARTBEAT_INTERVAL=1000ms
+      - SUSPECT_TIMEOUT=5000ms
+      - DEAD_TIMEOUT=12000ms
       - API_PORT=8083
       - SERVICES=           # nessun servizio (vuoto)
       - SERVICE_TTL=15
@@ -88,10 +88,10 @@ services:
       - SELF_ID=node5
       - SELF_ADDR=node5:9004
       - SEEDS=node1:9000,node2:9001,node3:9002,node4:9003,node6:9005,node7:9006
-      - GOSSIP_INTERVAL=700ms
-      - HEARTBEAT_INTERVAL=500ms
-      - SUSPECT_TIMEOUT=2500ms
-      - DEAD_TIMEOUT=6000ms
+      - GOSSIP_INTERVAL=1400ms
+      - HEARTBEAT_INTERVAL=1000ms
+      - SUSPECT_TIMEOUT=5000ms
+      - DEAD_TIMEOUT=12000ms
       - API_PORT=8084
       - SERVICES=           # nessun servizio (vuoto)
       - SERVICE_TTL=15
@@ -107,10 +107,10 @@ services:
       - SELF_ID=node6
       - SELF_ADDR=node6:9005
       - SEEDS=node1:9000,node2:9001,node3:9002,node4:9003,node5:9004,node7:9006
-      - GOSSIP_INTERVAL=700ms
-      - HEARTBEAT_INTERVAL=500ms
-      - SUSPECT_TIMEOUT=2500ms
-      - DEAD_TIMEOUT=6000ms
+      - GOSSIP_INTERVAL=1400ms
+      - HEARTBEAT_INTERVAL=1000ms
+      - SUSPECT_TIMEOUT=5000ms
+      - DEAD_TIMEOUT=12000ms
       - API_PORT=8085
       - SERVICES=           # nessun servizio (vuoto)
       - SERVICE_TTL=15
@@ -126,10 +126,10 @@ services:
       - SELF_ID=node7
       - SELF_ADDR=node7:9006
       - SEEDS=node1:9000,node2:9001,node3:9002,node4:9003,node5:9004,node6:9005
-      - GOSSIP_INTERVAL=700ms
-      - HEARTBEAT_INTERVAL=500ms
-      - SUSPECT_TIMEOUT=2500ms
-      - DEAD_TIMEOUT=6000ms
+      - GOSSIP_INTERVAL=1400ms
+      - HEARTBEAT_INTERVAL=1000ms
+      - SUSPECT_TIMEOUT=5000ms
+      - DEAD_TIMEOUT=12000ms
       - API_PORT=8086
       - SERVICES=           # nessun servizio (vuoto)
       - SERVICE_TTL=15
@@ -150,7 +150,7 @@ services:
       - node5
       - node6
       - node7
-    restart: unless-stopped
+    restart: no
 
 networks:
   default:

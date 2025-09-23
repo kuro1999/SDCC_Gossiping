@@ -141,6 +141,7 @@ type Config struct {
 	CalcPort         int    // porta del servizio demo calc
 	ServiceTTL       int    // TTL in secondi (annunci)
 	MaxServiceDigest int    // quanti annunci piggyback per messaggio
+
 }
 
 type Node struct {
@@ -150,9 +151,10 @@ type Node struct {
 	members map[string]*Member
 
 	// service registry
-	services map[string]*ServiceInstance // key = svcKey
-	selfHB   uint64
-	udpPort  int
+	services   map[string]*ServiceInstance // key = svcKey
+	selfHB     uint64
+	udpPort    int
+	lastSvcVer map[string]uint64 // ultima versione vista per chiave
 	//struct eventi
 	eventCh chan struct{}
 	//metriche
@@ -242,6 +244,7 @@ func NewNode() (*Node, error) {
 	if EnableEventGossip {
 		n.eventCh = make(chan struct{}, 64) // BUFFERIZZATO: evita blocchi
 	}
+	n.lastSvcVer = make(map[string]uint64)
 
 	now := time.Now()
 	n.members[id] = &Member{
@@ -390,7 +393,6 @@ func (n *Node) suspicionLoop() {
 	}
 }
 
-// Canale per eventi che triggerano un gossip immediato
 // Canale per eventi che triggerano un gossip immediato
 func (n *Node) onEventTrigger() {
 	if !EnableEventGossip || n.eventCh == nil {
@@ -640,7 +642,7 @@ func (n *Node) mergeMembership(gm *GossipMessage) int {
 				LastSeen: now,
 			}
 			updated++
-			log.Printf("[MERGE] Nuovo membro aggiunto: %s", gm.FromID)
+			//log.Printf("[MERGE] Nuovo membro aggiunto: %s", gm.FromID)
 		}
 	}
 
@@ -685,12 +687,18 @@ func (n *Node) mergeServices(gm *GossipMessage) int {
 		key := svcKey(ann.Service, ann.InstanceID)
 		cur, ok := n.services[key]
 
-		// ignora annunci vecchi
+		// monotonicità globale: scarta se la versione è <= dell'ultima vista
+		last := n.lastSvcVer[key]
+		if ann.Version <= last {
+			continue
+		}
+		// ridondante, ma sicuro: se esiste cur e la versione non supera cur.Version, ignora
 		if ok && ann.Version <= cur.Version {
 			continue
 		}
-		// applica aggiornamento
-		n.services[key] = &ServiceInstance{
+
+		// accetta annuncio
+		inst := &ServiceInstance{
 			Service:     ann.Service,
 			InstanceID:  ann.InstanceID,
 			NodeID:      ann.NodeID,
@@ -702,8 +710,14 @@ func (n *Node) mergeServices(gm *GossipMessage) int {
 			LastUpdated: time.Unix(ann.LastUpdatedUnix, 0),
 		}
 		// normalizza LastUpdated
-		if n.services[key].LastUpdated.IsZero() || n.services[key].LastUpdated.After(now) {
-			n.services[key].LastUpdated = now
+		if inst.LastUpdated.IsZero() || inst.LastUpdated.After(now) {
+			inst.LastUpdated = now
+		}
+
+		n.services[key] = inst
+		// aggiorna la waterline di versione
+		if ann.Version > n.lastSvcVer[key] {
+			n.lastSvcVer[key] = ann.Version
 		}
 		updated++
 	}
@@ -719,41 +733,99 @@ func (n *Node) registerLocalService(service, instanceID, addr string, ttl int) {
 
 	key := svcKey(service, instanceID)
 	cur, ok := n.services[key]
+
+	// calcola la prossima versione > max(cur.Version, lastSvcVer[key])
+	var base uint64
+	if ok && cur.Version > base {
+		base = cur.Version
+	}
+	if n.lastSvcVer[key] > base {
+		base = n.lastSvcVer[key]
+	}
+	nextVer := base + 1
+
+	// ttl di backup (come prima)
+	if ttl <= 0 {
+		ttl = 15
+	}
+
 	if !ok {
+		// nuova entry
 		cur = &ServiceInstance{
 			Service:     service,
 			InstanceID:  instanceID,
 			NodeID:      n.cfg.SelfID,
 			Addr:        addr,
-			Version:     1,
+			Version:     nextVer,
 			TTLSeconds:  ttl,
 			Up:          true,
+			Tombstone:   false,
 			LastUpdated: now,
 		}
 		n.services[key] = cur
-		log.Printf("[SVC] registrato %s id=%s addr=%s ttl=%ds", service, instanceID, addr, ttl)
+		n.lastSvcVer[key] = nextVer
+		log.Printf("[SVC] registrato %s id=%s addr=%s ttl=%ds ver=%d", service, instanceID, addr, ttl, nextVer)
 		return
 	}
-	// refresh: bump versione e ts
-	cur.Version++
+
+	// refresh/ri-attivazione su entry esistente
+	cur.Version = nextVer
 	cur.Up = true
+	cur.Tombstone = false
 	cur.LastUpdated = now
 	if addr != "" {
 		cur.Addr = addr
 	}
+	cur.TTLSeconds = ttl // mantieni aggiornato anche il TTL se lo cambi
+	n.lastSvcVer[key] = nextVer
+
+	log.Printf("[SVC] refresh %s id=%s addr=%s ttl=%ds ver=%d", service, instanceID, cur.Addr, cur.TTLSeconds, nextVer)
 }
 
 func (n *Node) deregisterLocalService(service, instanceID string) {
+	now := time.Now()
+
 	n.mu.Lock()
 	defer n.mu.Unlock()
+
 	key := svcKey(service, instanceID)
-	if cur, ok := n.services[key]; ok {
-		cur.Version++
+	cur, ok := n.services[key]
+
+	// calcola la prossima versione > max(cur.Version, lastSvcVer[key])
+	var base uint64
+	if ok && cur.Version > base {
+		base = cur.Version
+	}
+	if n.lastSvcVer[key] > base {
+		base = n.lastSvcVer[key]
+	}
+	nextVer := base + 1
+
+	if !ok {
+		// crea direttamente un tombstone per propagare la rimozione
+		n.services[key] = &ServiceInstance{
+			Service:     service,
+			InstanceID:  instanceID,
+			NodeID:      n.cfg.SelfID,
+			Addr:        "", // opzionale; non serve per il tombstone
+			Version:     nextVer,
+			TTLSeconds:  n.cfg.ServiceTTL, // mantieni un TTL ragionevole
+			Up:          false,
+			Tombstone:   true,
+			LastUpdated: now,
+		}
+	} else {
+		cur.Version = nextVer
 		cur.Up = false
 		cur.Tombstone = true
-		cur.LastUpdated = time.Now()
-		log.Printf("[SVC] deregistrato %s id=%s", service, instanceID)
+		cur.LastUpdated = now
+		// (lascia cur.Addr e cur.TTLSeconds come sono; non serve modificarli)
 	}
+
+	// aggiorna la waterline
+	n.lastSvcVer[key] = nextVer
+
+	log.Printf("[SVC] deregistrato %s id=%s ver=%d", service, instanceID, nextVer)
 }
 
 func (n *Node) pruneExpiredServices() {
@@ -798,7 +870,98 @@ func (n *Node) serviceRefreshLoop() {
 func (n *Node) startDiscoveryAPI(port int) {
 	mux := http.NewServeMux()
 
-	// GET /discover?service=calc
+	// --- POST /service/register ---
+	// Aggiunge/refresh-a un'istanza locale e (se abilitato) scatena gossip immediato.
+	mux.HandleFunc("/service/register", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "use POST", http.StatusMethodNotAllowed)
+			return
+		}
+		var req svcRegisterReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		req.Service = strings.TrimSpace(req.Service)
+		req.InstanceID = strings.TrimSpace(req.InstanceID)
+		req.Addr = strings.TrimSpace(req.Addr)
+		if req.Service == "" || req.InstanceID == "" || req.Addr == "" {
+			http.Error(w, "missing fields: service, instance_id, addr", http.StatusBadRequest)
+			return
+		}
+		if req.TTL <= 0 {
+			req.TTL = n.cfg.ServiceTTL
+		}
+
+		n.registerLocalService(req.Service, req.InstanceID, req.Addr, req.TTL)
+
+		if EnableEventGossip {
+			n.onEventTrigger() // diffondi subito la novità
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	})
+
+	// --- POST /service/deregister ---
+	// Marca un'istanza locale come tombstone e (se abilitato) scatena gossip immediato.
+	mux.HandleFunc("/service/deregister", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "use POST", http.StatusMethodNotAllowed)
+			return
+		}
+		var req svcDeregisterReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		req.Service = strings.TrimSpace(req.Service)
+		req.InstanceID = strings.TrimSpace(req.InstanceID)
+		if req.Service == "" || req.InstanceID == "" {
+			http.Error(w, "missing fields: service, instance_id", http.StatusBadRequest)
+			return
+		}
+
+		n.deregisterLocalService(req.Service, req.InstanceID)
+
+		if EnableEventGossip {
+			n.onEventTrigger()
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	})
+
+	// --- (opzionale) GET /services/local ---
+	mux.HandleFunc("/services/local", func(w http.ResponseWriter, r *http.Request) {
+		type out struct {
+			Service    string `json:"service"`
+			InstanceID string `json:"id"`
+			Addr       string `json:"addr"`
+			Version    uint64 `json:"ver"`
+			TTL        int    `json:"ttl"`
+			Up         bool   `json:"up"`
+			AgeSec     int64  `json:"age_sec"`
+		}
+		now := time.Now()
+		resp := []out{}
+		n.mu.Lock()
+		for _, s := range n.services {
+			if s.NodeID != n.cfg.SelfID {
+				continue
+			}
+			resp = append(resp, out{
+				Service: s.Service, InstanceID: s.InstanceID, Addr: s.Addr,
+				Version: s.Version, TTL: s.TTLSeconds, Up: s.Up,
+				AgeSec: int64(now.Sub(s.LastUpdated).Seconds()),
+			})
+		}
+		n.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+
+	// --- GET /discover?service=calc (tuo handler esistente, invariato) ---
 	mux.HandleFunc("/discover", func(w http.ResponseWriter, r *http.Request) {
 		svc := r.URL.Query().Get("service")
 		if strings.TrimSpace(svc) == "" {
@@ -981,6 +1144,8 @@ func (n *Node) printView() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	now := time.Now()
+
 	type row struct {
 		ID   string
 		St   MemberState
@@ -988,6 +1153,8 @@ func (n *Node) printView() {
 		Last string
 		Addr string
 	}
+
+	// --- costruisci righe membri ordinate ---
 	rows := make([]row, 0, len(n.members))
 	for _, m := range n.members {
 		last := "-"
@@ -998,12 +1165,58 @@ func (n *Node) printView() {
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
 
-	log.Printf("[VIEW] ----- %s -----", n.cfg.SelfID)
-	for _, r := range rows {
-		log.Printf("  %-10s  %-7s  hb=%-6d  last=%-12s  %s", r.ID, r.St, r.HB, r.Last, r.Addr)
+	// --- indicizza i servizi per NodeID per stampa per-nodo ---
+	// nota: teniamo i puntatori per non copiare strutture
+	svcsByNode := make(map[string][]*ServiceInstance, len(n.services))
+	for _, s := range n.services {
+		svcsByNode[s.NodeID] = append(svcsByNode[s.NodeID], s)
+	}
+	// ordina i servizi per (Service, InstanceID) per ogni nodo
+	for _, list := range svcsByNode {
+		sort.Slice(list, func(i, j int) bool {
+			if list[i].Service != list[j].Service {
+				return list[i].Service < list[j].Service
+			}
+			return list[i].InstanceID < list[j].InstanceID
+		})
 	}
 
-	// stampa compatta dei servizi noti
+	log.Printf("[VIEW] ----- %s -----", n.cfg.SelfID)
+	for _, r := range rows {
+		// stampa riga membro
+		log.Printf("  %-10s  %-7s  hb=%-6d  last=%-12s  %s", r.ID, r.St, r.HB, r.Last, r.Addr)
+
+		// stampa, sotto il nodo, i servizi offerti da quel nodo (se presenti)
+		if list := svcsByNode[r.ID]; len(list) > 0 {
+			for _, s := range list {
+				// --- calcolo stato e metadati per stampa leggibile ---
+				ttl := s.TTLSeconds
+				if ttl <= 0 {
+					ttl = 15 // fallback coerente col resto del codice
+				}
+				age := now.Sub(s.LastUpdated).Truncate(time.Millisecond)
+				expired := age > time.Duration(ttl)*time.Second
+
+				status := "down"
+				switch {
+				case s.Tombstone:
+					status = "tomb" // deregistrato/mark rimozione
+				case s.Up && !expired:
+					status = "up" // attivo e fresco
+				case s.Up && expired:
+					status = "stale" // attivo ma oltre TTL (potenziale scadenza)
+				default:
+					status = "down"
+				}
+
+				// nota: indentazione per raggruppare visivamente i servizi sotto il nodo
+				log.Printf("      └─ svc=%-10s id=%-14s %-5s ver=%-3d ttl=%-2ds age=%-8s addr=%s",
+					s.Service, s.InstanceID, status, s.Version, ttl, age, s.Addr)
+			}
+		}
+	}
+
+	// --- stampa compatta dei servizi noti (lasciata come in origine) ---
 	type srow struct {
 		K string
 		S ServiceInstance
