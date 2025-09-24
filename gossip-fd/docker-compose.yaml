@@ -1,12 +1,31 @@
 version: "3.9"
+
 services:
+  # --- Registry (bootstrap only) ---
+  registry:
+    build:
+      context: ./registry
+      dockerfile: Dockerfile
+    container_name: registry
+    environment:
+      - registry_port=8089
+
+    ports:
+      - "8089:8089"
+
+
+  # --- Node 1 ---
   node1:
-    build: .
+    build: .          # cartella con il codice del nodo
     container_name: node1
+    depends_on:
+      - registry
     environment:
       - SELF_ID=node1
       - SELF_ADDR=node1:9000
-      - SEEDS=node2:9001,node3:9002,node4:9003,node5:9004,node6:9005,node7:9006
+      - REGISTRY_URL=registry:8089
+      - REGISTRY_JOIN_TIMEOUT=3s
+      - SEEDS=                   # opzionale fallback, tienilo vuoto o rimuovi
       - GOSSIP_INTERVAL=1400ms
       - HEARTBEAT_INTERVAL=1000ms
       - SUSPECT_TIMEOUT=5000ms
@@ -19,16 +38,20 @@ services:
       - MAX_SERVICE_DIGEST=64
     ports:
       - "9000:9000/udp"
-      - "8080:8080"      # discovery API
-      - "18080:18080"    # calc
+      - "8080:8080"
+      - "18080:18080"
+    restart: unless-stopped
 
   node2:
     build: .
     container_name: node2
+    depends_on: [registry]
     environment:
       - SELF_ID=node2
       - SELF_ADDR=node2:9001
-      - SEEDS=node1:9000,node3:9002,node4:9003,node5:9004,node6:9005,node7:9006
+      - REGISTRY_URL=registry:8089
+      - REGISTRY_JOIN_TIMEOUT=3s
+      - SEEDS=
       - GOSSIP_INTERVAL=1400ms
       - HEARTBEAT_INTERVAL=1000ms
       - SUSPECT_TIMEOUT=5000ms
@@ -42,101 +65,132 @@ services:
       - "9001:9001/udp"
       - "8081:8081"
       - "18081:18081"
+    restart: unless-stopped
 
   node3:
     build: .
     container_name: node3
+    depends_on: [registry]
     environment:
       - SELF_ID=node3
       - SELF_ADDR=node3:9002
-      - SEEDS=node1:9000,node2:9001,node4:9003,node5:9004,node6:9005,node7:9006
+      - REGISTRY_URL=registry:8089
+      - REGISTRY_JOIN_TIMEOUT=3s
+      - SEEDS=
       - GOSSIP_INTERVAL=1400ms
       - HEARTBEAT_INTERVAL=1000ms
       - SUSPECT_TIMEOUT=5000ms
       - DEAD_TIMEOUT=12000ms
       - API_PORT=8082
-      - SERVICES=calc           # nessun servizio (vuoto)
+      - SERVICES=calc
+      - CALC_PORT=18082
       - SERVICE_TTL=15
       - MAX_SERVICE_DIGEST=64
     ports:
       - "9002:9002/udp"
       - "8082:8082"
+      - "18082:18082"
+    restart: unless-stopped
 
   node4:
     build: .
     container_name: node4
+    depends_on: [registry]
     environment:
       - SELF_ID=node4
       - SELF_ADDR=node4:9003
-      - SEEDS=node1:9000,node2:9001,node3:9002,node5:9004,node6:9005,node7:9006
+      - REGISTRY_URL=registry:8089
+      - REGISTRY_JOIN_TIMEOUT=3s
+      - SEEDS=
       - GOSSIP_INTERVAL=1400ms
       - HEARTBEAT_INTERVAL=1000ms
       - SUSPECT_TIMEOUT=5000ms
       - DEAD_TIMEOUT=12000ms
       - API_PORT=8083
-      - SERVICES=           # nessun servizio (vuoto)
+      - SERVICES=
+      - CALC_PORT=18083
       - SERVICE_TTL=15
       - MAX_SERVICE_DIGEST=64
     ports:
       - "9003:9003/udp"
       - "8083:8083"
+      - "18083:18083"
+    restart: unless-stopped
 
   node5:
     build: .
     container_name: node5
+    depends_on: [registry]
     environment:
       - SELF_ID=node5
       - SELF_ADDR=node5:9004
-      - SEEDS=node1:9000,node2:9001,node3:9002,node4:9003,node6:9005,node7:9006
+      - REGISTRY_URL=registry:8089
+      - REGISTRY_JOIN_TIMEOUT=3s
+      - SEEDS=
       - GOSSIP_INTERVAL=1400ms
       - HEARTBEAT_INTERVAL=1000ms
       - SUSPECT_TIMEOUT=5000ms
       - DEAD_TIMEOUT=12000ms
       - API_PORT=8084
-      - SERVICES=           # nessun servizio (vuoto)
+      - SERVICES=
+      - CALC_PORT=18084
       - SERVICE_TTL=15
       - MAX_SERVICE_DIGEST=64
     ports:
       - "9004:9004/udp"
       - "8084:8084"
+      - "18084:18084"
+    restart: unless-stopped
 
   node6:
     build: .
     container_name: node6
+    depends_on: [registry]
     environment:
       - SELF_ID=node6
       - SELF_ADDR=node6:9005
-      - SEEDS=node1:9000,node2:9001,node3:9002,node4:9003,node5:9004,node7:9006
+      - REGISTRY_URL=registry:8089
+      - REGISTRY_JOIN_TIMEOUT=3s
+      - SEEDS=
       - GOSSIP_INTERVAL=1400ms
       - HEARTBEAT_INTERVAL=1000ms
       - SUSPECT_TIMEOUT=5000ms
       - DEAD_TIMEOUT=12000ms
       - API_PORT=8085
-      - SERVICES=           # nessun servizio (vuoto)
+      - SERVICES=
+      - CALC_PORT=18085
       - SERVICE_TTL=15
       - MAX_SERVICE_DIGEST=64
     ports:
       - "9005:9005/udp"
       - "8085:8085"
+      - "18085:18085"
+    restart: unless-stopped
 
   node7:
     build: .
     container_name: node7
+    depends_on: [registry]
     environment:
       - SELF_ID=node7
       - SELF_ADDR=node7:9006
-      - SEEDS=node1:9000,node2:9001,node3:9002,node4:9003,node5:9004,node6:9005
+      - REGISTRY_URL=registry:8089
+      - REGISTRY_JOIN_TIMEOUT=3s
+      - SEEDS=
       - GOSSIP_INTERVAL=1400ms
       - HEARTBEAT_INTERVAL=1000ms
       - SUSPECT_TIMEOUT=5000ms
       - DEAD_TIMEOUT=12000ms
       - API_PORT=8086
-      - SERVICES=           # nessun servizio (vuoto)
+      - SERVICES=
+      - CALC_PORT=18086
       - SERVICE_TTL=15
       - MAX_SERVICE_DIGEST=64
     ports:
       - "9006:9006/udp"
       - "8086:8086"
+      - "18086:18086"
+    restart: unless-stopped
 
   orchestrator:
     build:

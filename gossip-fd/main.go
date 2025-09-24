@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -142,6 +143,8 @@ type Config struct {
 	ServiceTTL       int    // TTL in secondi (annunci)
 	MaxServiceDigest int    // quanti annunci piggyback per messaggio
 
+	//registry
+	RegistryURL string
 }
 
 type Node struct {
@@ -160,6 +163,8 @@ type Node struct {
 	//metriche
 	metricPeriodic uint64 // # batch gossip inviati per motivo "periodic"
 	metricEvent    uint64 // # batch gossip inviati per motivo "event"
+	//registry
+	RegistryURL string
 }
 
 // ---------------- Utilità env ----------------
@@ -226,6 +231,7 @@ func NewNode() (*Node, error) {
 		CalcPort:          parseIntEnv("CALC_PORT", 18080),
 		ServiceTTL:        parseIntEnv("SERVICE_TTL", 15),
 		MaxServiceDigest:  parseIntEnv("MAX_SERVICE_DIGEST", 64),
+		RegistryURL:       "registry:8089",
 	}
 
 	udpAddr := net.UDPAddr{IP: net.IPv4zero, Port: port}
@@ -241,6 +247,7 @@ func NewNode() (*Node, error) {
 		services: make(map[string]*ServiceInstance),
 		udpPort:  port,
 	}
+	n.RegistryURL = cfg.RegistryURL
 	if EnableEventGossip {
 		n.eventCh = make(chan struct{}, 64) // BUFFERIZZATO: evita blocchi
 	}
@@ -279,10 +286,32 @@ func NewNode() (*Node, error) {
 }
 
 func (n *Node) run() {
-	log.Printf("[BOOT] %s su %s | API :%d | services=%q | seeds=%s",
-		n.cfg.SelfID, n.cfg.SelfAddr, n.cfg.APIPort, n.cfg.ServicesCSV, os.Getenv("SEEDS"))
+	log.Printf("[BOOT] %s su %s | API :%d | services=%q | registry=%s | seeds=%s",
+		n.cfg.SelfID, n.cfg.SelfAddr, n.cfg.APIPort, n.cfg.ServicesCSV, n.cfg.RegistryURL, os.Getenv("SEEDS"))
 
-	// membership
+	// 1) Ottieni la lista di peer dal registry (se configurato)
+	peers, err := n.bootstrapFromRegistry()
+	if err != nil {
+		log.Printf("[ERROR] Errore nel bootstrap dal registry: %v", err)
+	} else {
+		// Aggiungi i peer al nodo
+		for _, peer := range peers {
+			if peer == n.cfg.SelfAddr {
+				continue // non aggiungere se il peer è se stesso
+			}
+			// Aggiungi i peer alla lista dei membri
+			peerID := peer
+			n.members[peerID] = &Member{
+				ID:        peerID,
+				Addr:      peer,
+				Heartbeat: 0,
+				LastSeen:  time.Time{},
+				State:     StateSuspect,
+			}
+		}
+	}
+
+	// membership (queste goroutine iniziano ora)
 	go n.receiveLoop()
 	go n.heartbeatLoop()
 	go n.gossipLoop()
@@ -294,14 +323,60 @@ func (n *Node) run() {
 
 	// refresh/TTL per servizi locali
 	go n.serviceRefreshLoop()
-	// --- avvio metriche ---
+
+	// Avvio metriche
 	go n.metricsLoop()
-	// stampa periodica view
+
+	// Stampa periodica view
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
 		n.printView()
 	}
+}
+
+// bootstrapFromRegistry effettua il bootstrap del nodo contattando il registry per ottenere i peer
+func (n *Node) bootstrapFromRegistry() ([]string, error) {
+	// URL del registry per ottenere la lista dei peer
+	url := fmt.Sprintf("http://%s/api/join", n.cfg.RegistryURL)
+
+	// Creazione del corpo della richiesta POST con id e indirizzo del nodo
+	body := map[string]string{
+		"id":   n.cfg.SelfID,
+		"addr": n.cfg.SelfAddr,
+	}
+	b, _ := json.Marshal(body)
+
+	// Creazione della richiesta HTTP
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(b))
+	if err != nil {
+		return nil, fmt.Errorf("errore nella creazione della richiesta: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	// Invio della richiesta al registry
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("errore nel contattare il registry: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Verifica che lo stato della risposta sia 200 OK
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("errore nel rispondere dal registry: status %d", resp.StatusCode)
+	}
+
+	// Decodifica della risposta JSON che contiene la lista dei peer
+	var respBody struct {
+		Peers []string `json:"peers"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&respBody); err != nil {
+		return nil, fmt.Errorf("errore nella decodifica della risposta del registry: %v", err)
+	}
+
+	// Restituisce la lista dei peer ottenuti dal registry
+	return respBody.Peers, nil
 }
 
 // ---------------- Heartbeat & suspicion ----------------
@@ -1146,6 +1221,53 @@ func (n *Node) printView() {
 
 	now := time.Now()
 
+	// ================== DEDUPLICA PER ADDRESS ==================
+	// Idee:
+	// - Collassiamo le entry che condividono lo stesso Addr.
+	// - Preferiamo la entry con ID "pulito" (senza ':'); a parità, quella con HB più alto,
+	//   poi quella con LastSeen più recente.
+	// - Manteniamo anche eventuali membri senza Addr (chiave fittizia "ID::<id>").
+	canonical := make(map[string]*Member, len(n.members)) // chiave: Addr oppure "ID::<id>" se Addr vuoto
+
+	for _, m := range n.members {
+		addr := strings.TrimSpace(m.Addr)
+		if addr == "" {
+			key := "ID::" + m.ID
+			if prev, ok := canonical[key]; ok {
+				// scegli il migliore per ID "orfano"
+				if m.Heartbeat > prev.Heartbeat || (m.Heartbeat == prev.Heartbeat && m.LastSeen.After(prev.LastSeen)) {
+					canonical[key] = m
+				}
+			} else {
+				canonical[key] = m
+			}
+			continue
+		}
+
+		if prev, ok := canonical[addr]; ok {
+			prevIsEndpoint := strings.Contains(prev.ID, ":")
+			curIsEndpoint := strings.Contains(m.ID, ":")
+
+			better := false
+			switch {
+			// preferisci ID senza ":" rispetto a endpoint
+			case prevIsEndpoint && !curIsEndpoint:
+				better = true
+			// a parità di "tipo" (entrambi puliti o entrambi endpoint), usa HB e recency
+			case prevIsEndpoint == curIsEndpoint &&
+				(m.Heartbeat > prev.Heartbeat || (m.Heartbeat == prev.Heartbeat && m.LastSeen.After(prev.LastSeen))):
+				better = true
+			}
+
+			if better {
+				canonical[addr] = m
+			}
+		} else {
+			canonical[addr] = m
+		}
+	}
+
+	// ================== COSTRUZIONE RIGHE MEMBRI ==================
 	type row struct {
 		ID   string
 		St   MemberState
@@ -1154,24 +1276,36 @@ func (n *Node) printView() {
 		Addr string
 	}
 
-	// --- costruisci righe membri ordinate ---
-	rows := make([]row, 0, len(n.members))
-	for _, m := range n.members {
+	rows := make([]row, 0, len(canonical))
+	for key, m := range canonical {
+		// Calcolo "last"
 		last := "-"
 		if !m.LastSeen.IsZero() {
 			last = time.Since(m.LastSeen).Truncate(time.Millisecond).String() + " ago"
 		}
-		rows = append(rows, row{ID: m.ID, St: m.State, HB: m.Heartbeat, Last: last, Addr: m.Addr})
+
+		// Ricava l'Addr anche per i "ID::" orfani
+		addr := m.Addr
+		if strings.HasPrefix(key, "ID::") && addr == "" {
+			addr = m.Addr
+		}
+
+		rows = append(rows, row{
+			ID:   m.ID,
+			St:   m.State,
+			HB:   m.Heartbeat,
+			Last: last,
+			Addr: addr,
+		})
 	}
+
 	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
 
-	// --- indicizza i servizi per NodeID per stampa per-nodo ---
-	// nota: teniamo i puntatori per non copiare strutture
+	// ================== INDICIZZA SERVIZI PER NODEID ==================
 	svcsByNode := make(map[string][]*ServiceInstance, len(n.services))
 	for _, s := range n.services {
 		svcsByNode[s.NodeID] = append(svcsByNode[s.NodeID], s)
 	}
-	// ordina i servizi per (Service, InstanceID) per ogni nodo
 	for _, list := range svcsByNode {
 		sort.Slice(list, func(i, j int) bool {
 			if list[i].Service != list[j].Service {
@@ -1181,18 +1315,18 @@ func (n *Node) printView() {
 		})
 	}
 
+	// ================== STAMPA ==================
 	log.Printf("[VIEW] ----- %s -----", n.cfg.SelfID)
 	for _, r := range rows {
-		// stampa riga membro
+		// riga membro (solo canonici, niente alias duplicati)
 		log.Printf("  %-10s  %-7s  hb=%-6d  last=%-12s  %s", r.ID, r.St, r.HB, r.Last, r.Addr)
 
-		// stampa, sotto il nodo, i servizi offerti da quel nodo (se presenti)
+		// servizi sotto il nodo (usiamo NodeID esatto)
 		if list := svcsByNode[r.ID]; len(list) > 0 {
 			for _, s := range list {
-				// --- calcolo stato e metadati per stampa leggibile ---
 				ttl := s.TTLSeconds
 				if ttl <= 0 {
-					ttl = 15 // fallback coerente col resto del codice
+					ttl = 15
 				}
 				age := now.Sub(s.LastUpdated).Truncate(time.Millisecond)
 				expired := age > time.Duration(ttl)*time.Second
@@ -1200,23 +1334,22 @@ func (n *Node) printView() {
 				status := "down"
 				switch {
 				case s.Tombstone:
-					status = "tomb" // deregistrato/mark rimozione
+					status = "tomb"
 				case s.Up && !expired:
-					status = "up" // attivo e fresco
+					status = "up"
 				case s.Up && expired:
-					status = "stale" // attivo ma oltre TTL (potenziale scadenza)
+					status = "stale"
 				default:
 					status = "down"
 				}
 
-				// nota: indentazione per raggruppare visivamente i servizi sotto il nodo
 				log.Printf("      └─ svc=%-10s id=%-14s %-5s ver=%-3d ttl=%-2ds age=%-8s addr=%s",
 					s.Service, s.InstanceID, status, s.Version, ttl, age, s.Addr)
 			}
 		}
 	}
 
-	// --- stampa compatta dei servizi noti (lasciata come in origine) ---
+	// ================== RIEPILOGO SERVIZI (come prima) ==================
 	type srow struct {
 		K string
 		S ServiceInstance
