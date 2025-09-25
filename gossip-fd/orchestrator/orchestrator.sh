@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # ===== Config essenziale (override via env) =====
-: "${DISCOVERY_NODES:=node1:8080,node2:8081,node3:8082}"  # nodi API (host:port)
+: "${DISCOVERY_NODES:=node1:9000,node2:9001,node3:9002}"  # nodi API (host:port) - Opzione 1
 : "${SERVICE:=calc}"                                       # servizio target
 : "${OP:=sum}"                                             # operazione da invocare
 : "${A:=1}" : "${B:=2}"                                    # parametri per l'operazione
 : "${STARTUP_WAIT:=2}"                                     # attesa iniziale (s)
 : "${REG_TTL:=15}"                                         # TTL per la register
 : "${REG_ID_PREFIX:=dyn}"                                  # prefisso instance id
-: "${REMOVE_DELAY:=10}"                                     # attesa prima della deregister (s)
+: "${REMOVE_DELAY:=10}"                                    # attesa prima della deregister (s)
 
 # ===== Derivate minime =====
 API_NODE="${DISCOVERY_NODES%%,*}"          # primo nodo della lista

@@ -165,6 +165,8 @@ type Node struct {
 	metricEvent    uint64 // # batch gossip inviati per motivo "event"
 	//registry
 	RegistryURL string
+	httpClient  *http.Client    // client HTTP con timeout
+	votedDead   map[string]bool // chiave: peerID -> ho già votato DEAD per questo ciclo
 }
 
 // ---------------- Utilità env ----------------
@@ -201,6 +203,45 @@ func parseIntEnv(key string, def int) int {
 	return n
 }
 
+// voteDead invia un singolo voto al registry per rimuovere "suspectID".
+// Viene chiamata SOLO al cambio di stato a DEAD (transizione), quindi è già unica.
+func (n *Node) voteDead(suspectID string) {
+	if suspectID == "" || suspectID == n.cfg.SelfID {
+		return
+	}
+	url := fmt.Sprintf("http://%s/api/vote-dead", n.cfg.RegistryURL)
+	body := map[string]string{
+		"voter_id":   n.cfg.SelfID,
+		"suspect_id": suspectID,
+	}
+	b, _ := json.Marshal(body)
+
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(b))
+	if err != nil {
+		log.Printf("[VOTE] build err suspect=%s: %v", suspectID, err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := n.httpClient.Do(req)
+	if err != nil {
+		log.Printf("[VOTE] http err suspect=%s: %v", suspectID, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[VOTE] bad status suspect=%s: %d", suspectID, resp.StatusCode)
+		return
+	}
+	var out struct {
+		Tally, Majority, Total int
+		Evicted                bool
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	log.Printf("[VOTE] %s tally=%d/%d evicted=%v", suspectID, out.Tally, out.Evicted)
+}
+
 // ---------------- Node init ----------------
 
 func NewNode() (*Node, error) {
@@ -218,6 +259,9 @@ func NewNode() (*Node, error) {
 		return nil, fmt.Errorf("porta invalida in SELF_ADDR: %v", err)
 	}
 
+	// Nota: default di API_PORT = porta UDP, non 8080
+	apiPort := parseIntEnv("API_PORT", port)
+
 	cfg := Config{
 		SelfID:            id,
 		SelfAddr:          addr,
@@ -226,12 +270,12 @@ func NewNode() (*Node, error) {
 		SuspectTimeout:    parseDurationEnv("SUSPECT_TIMEOUT", 2500*time.Millisecond),
 		DeadTimeout:       parseDurationEnv("DEAD_TIMEOUT", 6000*time.Millisecond),
 		MaxDigestPeers:    parseIntEnv("MAX_DIGEST", 64),
-		APIPort:           parseIntEnv("API_PORT", 8080),
+		APIPort:           apiPort, // <-- default allineato alla porta UDP
 		ServicesCSV:       mustEnv("SERVICES", ""),
 		CalcPort:          parseIntEnv("CALC_PORT", 18080),
 		ServiceTTL:        parseIntEnv("SERVICE_TTL", 15),
 		MaxServiceDigest:  parseIntEnv("MAX_SERVICE_DIGEST", 64),
-		RegistryURL:       "registry:8089",
+		RegistryURL:       mustEnv("REGISTRY_URL", "registry:8089"), // <-- da env
 	}
 
 	udpAddr := net.UDPAddr{IP: net.IPv4zero, Port: port}
@@ -247,9 +291,14 @@ func NewNode() (*Node, error) {
 		services: make(map[string]*ServiceInstance),
 		udpPort:  port,
 	}
-	n.RegistryURL = cfg.RegistryURL
+
+	// Client HTTP riusabile con timeout
+	n.httpClient = &http.Client{Timeout: 1 * time.Second}
+	// Voto unico per peer: flag per non votare due volte nella stessa “vita”
+	n.votedDead = make(map[string]bool)
+
 	if EnableEventGossip {
-		n.eventCh = make(chan struct{}, 64) // BUFFERIZZATO: evita blocchi
+		n.eventCh = make(chan struct{}, 64) // buffer per non bloccare
 	}
 	n.lastSvcVer = make(map[string]uint64)
 
@@ -262,7 +311,7 @@ func NewNode() (*Node, error) {
 		State:     StateAlive,
 	}
 
-	// seed peers
+	// seed peers (opzionali)
 	seeds := strings.Split(strings.TrimSpace(os.Getenv("SEEDS")), ",")
 	for _, s := range seeds {
 		s = strings.TrimSpace(s)
@@ -282,6 +331,16 @@ func NewNode() (*Node, error) {
 			State:     StateSuspect,
 		}
 	}
+
+	// Avviso se API e UDP non coincidono (solo warning informativo)
+	if n.cfg.APIPort != n.udpPort {
+		log.Printf("[WARN] API_PORT (%d) diverso dalla porta UDP (%d). "+
+			"Il registry restituisce indirizzi HTTP (API). Se non coincideranno con l'UDP, "+
+			"il gossip verso i peer del registry potrebbe non raggiungerli. "+
+			"Valuta di usare la stessa porta o estendere il registry con http_addr/udp_addr.",
+			n.cfg.APIPort, n.udpPort)
+	}
+
 	return n, nil
 }
 
@@ -289,45 +348,62 @@ func (n *Node) run() {
 	log.Printf("[BOOT] %s su %s | API :%d | services=%q | registry=%s | seeds=%s",
 		n.cfg.SelfID, n.cfg.SelfAddr, n.cfg.APIPort, n.cfg.ServicesCSV, n.cfg.RegistryURL, os.Getenv("SEEDS"))
 
-	// 1) Ottieni la lista di peer dal registry (se configurato)
-	peers, err := n.bootstrapFromRegistry()
-	if err != nil {
+	// host "canonico" del nodo (ID = solo host, mai con :porta)
+	selfHost, _, _ := strings.Cut(n.cfg.SelfAddr, ":")
+
+	// 1) Bootstrap dei peer dal registry (se configurato)
+	if peers, err := n.bootstrapFromRegistry(); err != nil {
 		log.Printf("[ERROR] Errore nel bootstrap dal registry: %v", err)
 	} else {
-		// Aggiungi i peer al nodo
-		for _, peer := range peers {
-			if peer == n.cfg.SelfAddr {
-				continue // non aggiungere se il peer è se stesso
+		for _, p := range peers {
+			// p è un addr HTTP "host:porta" restituito dal registry
+			host, _, _ := strings.Cut(p, ":")
+			if host == "" || host == selfHost {
+				// salta indirizzi vuoti o riferimenti a se stesso,
+				// anche se API_PORT e porta UDP differiscono
+				continue
 			}
-			// Aggiungi i peer alla lista dei membri
-			peerID := peer
-			n.members[peerID] = &Member{
-				ID:        peerID,
-				Addr:      peer,
-				Heartbeat: 0,
-				LastSeen:  time.Time{},
-				State:     StateSuspect,
+
+			n.mu.Lock()
+			if m, ok := n.members[host]; ok {
+				// già presente (es. arrivato da SEEDS) → aggiorna solo l'Addr
+				if m.Addr != p {
+					m.Addr = p
+				}
+				// se per qualche motivo era DEAD al boot, riportalo a SUSPECT
+				if m.State == StateDead {
+					m.State = StateSuspect
+					m.LastSeen = time.Time{}
+				}
+			} else {
+				// nuovo peer in vista iniziale
+				n.members[host] = &Member{
+					ID:        host, // ID canonico = solo host
+					Addr:      p,    // indirizzo completo host:porta per UDP/HTTP
+					Heartbeat: 0,
+					LastSeen:  time.Time{},
+					State:     StateSuspect,
+				}
 			}
+			n.mu.Unlock()
 		}
 	}
 
-	// membership (queste goroutine iniziano ora)
+	// 2) Avvio goroutine di membership/failure detector
 	go n.receiveLoop()
 	go n.heartbeatLoop()
 	go n.gossipLoop()
 	go n.suspicionLoop()
 
-	// service API + eventuale demo service
+	// 3) Avvio API HTTP (discovery + endpoint /api/membership/evict) e servizi demo
 	go n.startDiscoveryAPI(n.cfg.APIPort)
 	n.maybeStartDemoServices()
 
-	// refresh/TTL per servizi locali
+	// 4) Manutenzione TTL servizi + metriche
 	go n.serviceRefreshLoop()
-
-	// Avvio metriche
 	go n.metricsLoop()
 
-	// Stampa periodica view
+	// 5) Stampa periodica della view
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
@@ -340,10 +416,15 @@ func (n *Node) bootstrapFromRegistry() ([]string, error) {
 	// URL del registry per ottenere la lista dei peer
 	url := fmt.Sprintf("http://%s/api/join", n.cfg.RegistryURL)
 
-	// Creazione del corpo della richiesta POST con id e indirizzo del nodo
+	// Costruisco l'addr da pubblicare al registry usando la porta HTTP API
+	// (così il registry può inviare POST /api/membership/evict a questo endpoint)
+	host, _, _ := strings.Cut(n.cfg.SelfAddr, ":")
+	joinAddr := fmt.Sprintf("%s:%d", host, n.cfg.APIPort)
+
+	// Corpo della richiesta POST con id e indirizzo HTTP del nodo
 	body := map[string]string{
 		"id":   n.cfg.SelfID,
-		"addr": n.cfg.SelfAddr,
+		"addr": joinAddr, // IMPORTANTE: indirizzo HTTP per notifiche dal registry
 	}
 	b, _ := json.Marshal(body)
 
@@ -354,20 +435,18 @@ func (n *Node) bootstrapFromRegistry() ([]string, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	// Invio della richiesta al registry
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	// Invio della richiesta al registry (riuso il client con timeout)
+	resp, err := n.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("errore nel contattare il registry: %v", err)
 	}
 	defer resp.Body.Close()
 
-	// Verifica che lo stato della risposta sia 200 OK
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("errore nel rispondere dal registry: status %d", resp.StatusCode)
 	}
 
-	// Decodifica della risposta JSON che contiene la lista dei peer
+	// Decodifica della risposta JSON che contiene la lista dei peer (addr HTTP)
 	var respBody struct {
 		Peers []string `json:"peers"`
 	}
@@ -375,7 +454,7 @@ func (n *Node) bootstrapFromRegistry() ([]string, error) {
 		return nil, fmt.Errorf("errore nella decodifica della risposta del registry: %v", err)
 	}
 
-	// Restituisce la lista dei peer ottenuti dal registry
+	// Ritorno la lista dei peer (si assume stessa porta per UDP e HTTP)
 	return respBody.Peers, nil
 }
 
@@ -402,8 +481,7 @@ func (n *Node) suspicionLoop() {
 	for range t.C {
 		now := time.Now()
 
-		// raccolgo le transizioni e quante volte devo triggerare eventi,
-		// ma SENZA fare I/O o send sul canale sotto lock
+		// raccolgo le transizioni SENZA fare I/O durante il lock
 		type tr struct {
 			old      MemberState
 			new      MemberState
@@ -449,7 +527,32 @@ func (n *Node) suspicionLoop() {
 		n.mu.Unlock()
 		// --- fine sezione critica ---
 
-		// logging delle transizioni (fuori dal lock)
+		// deriva insiemi per voto/reset UNA VOLTA SOLA (fuori lock)
+		var toVote, toReset []string
+		for _, x := range transitions {
+			if x.new == StateDead && x.id != n.cfg.SelfID {
+				toVote = append(toVote, x.id)
+			}
+			if x.new == StateAlive {
+				toReset = append(toReset, x.id)
+			}
+		}
+
+		// aggiorna flag di voto con lock breve; decide chi votare ora
+		var fireVotes []string
+		n.mu.Lock()
+		for _, id := range toReset {
+			delete(n.votedDead, id) // se è tornato ALIVE, potremo rivotarlo in futuro
+		}
+		for _, id := range toVote {
+			if !n.votedDead[id] { // voto unico per questo ciclo di vita
+				n.votedDead[id] = true
+				fireVotes = append(fireVotes, id)
+			}
+		}
+		n.mu.Unlock()
+
+		// logging delle transizioni (fuori lock)
 		for _, x := range transitions {
 			log.Printf("[STATE] %s -> %s (peer=%s, lastSeen=%s, Δ=%s)",
 				x.old, x.new, x.id, x.lastSeen.Format(time.RFC3339), x.delta.Truncate(time.Millisecond))
@@ -458,12 +561,17 @@ func (n *Node) suspicionLoop() {
 			}
 		}
 
-		// trigger degli eventi (una volta per ogni passaggio a DEAD, come prima)
+		// invia i voti (best-effort) fuori dal lock
+		for _, sid := range fireVotes {
+			go n.voteDead(sid)
+		}
+
+		// trigger degli eventi (una volta per ogni passaggio a DEAD)
 		for i := 0; i < deadTriggers; i++ {
 			n.onEventTrigger()
 		}
 
-		// scadenze servizi (fa lock all’interno, ma qui siamo fuori dalla nostra sezione critica)
+		// scadenze servizi (fa lock al suo interno)
 		n.pruneExpiredServices()
 	}
 }
@@ -944,6 +1052,50 @@ func (n *Node) serviceRefreshLoop() {
 
 func (n *Node) startDiscoveryAPI(port int) {
 	mux := http.NewServeMux()
+
+	// --- POST /api/membership/evict ---
+	// Body: { "id": "<nodeID>" }
+	// Effetto: rimuove subito il nodo dalla membership e cancella i suoi servizi.
+	// Non usiamo quarantene/ban-list: evict è immediato e basta.
+	mux.HandleFunc("/api/membership/evict", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "use POST", http.StatusMethodNotAllowed)
+			return
+		}
+		var in struct {
+			ID string `json:"id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil || strings.TrimSpace(in.ID) == "" {
+			http.Error(w, "bad body", http.StatusBadRequest)
+			return
+		}
+		if in.ID == n.cfg.SelfID {
+			log.Printf("[EVICT] ignorato evict su self (%s)", in.ID)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+			return
+		}
+
+		n.mu.Lock()
+		// rimuovi dalla membership
+		delete(n.members, in.ID)
+		// rimuovi tutti i servizi ospitati da quel nodo
+		for k, s := range n.services {
+			if s.NodeID == in.ID {
+				delete(n.services, k)
+			}
+		}
+		// opzionale: resetta il flag di voto per permettere futuri cicli (se rientra)
+		delete(n.votedDead, in.ID)
+		n.mu.Unlock()
+
+		log.Printf("[EVICT] applicato evict per %s (rimosso da membership e servizi)", in.ID)
+
+		// opzionale: diffondi subito la nuova view
+		n.onEventTrigger()
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	})
 
 	// --- POST /service/register ---
 	// Aggiunge/refresh-a un'istanza locale e (se abilitato) scatena gossip immediato.

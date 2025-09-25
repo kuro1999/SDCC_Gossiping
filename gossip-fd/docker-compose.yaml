@@ -24,21 +24,19 @@ services:
       - SELF_ID=node1
       - SELF_ADDR=node1:9000
       - REGISTRY_URL=registry:8089
-      - REGISTRY_JOIN_TIMEOUT=3s
       - SEEDS=                   # opzionale fallback, tienilo vuoto o rimuovi
       - GOSSIP_INTERVAL=1400ms
       - HEARTBEAT_INTERVAL=1000ms
       - SUSPECT_TIMEOUT=5000ms
       - DEAD_TIMEOUT=12000ms
       # service discovery
-      - API_PORT=8080
       - SERVICES=
       - CALC_PORT=18080
       - SERVICE_TTL=15
       - MAX_SERVICE_DIGEST=64
     ports:
       - "9000:9000/udp"
-      - "8080:8080"
+      - "9000:9000/tcp"
       - "18080:18080"
     restart: unless-stopped
 
@@ -50,20 +48,18 @@ services:
       - SELF_ID=node2
       - SELF_ADDR=node2:9001
       - REGISTRY_URL=registry:8089
-      - REGISTRY_JOIN_TIMEOUT=3s
       - SEEDS=
       - GOSSIP_INTERVAL=1400ms
       - HEARTBEAT_INTERVAL=1000ms
       - SUSPECT_TIMEOUT=5000ms
       - DEAD_TIMEOUT=12000ms
-      - API_PORT=8081
       - SERVICES=
       - CALC_PORT=18081
       - SERVICE_TTL=15
       - MAX_SERVICE_DIGEST=64
     ports:
       - "9001:9001/udp"
-      - "8081:8081"
+      - "9001:9001/tcp"
       - "18081:18081"
     restart: unless-stopped
 
@@ -81,14 +77,13 @@ services:
       - HEARTBEAT_INTERVAL=1000ms
       - SUSPECT_TIMEOUT=5000ms
       - DEAD_TIMEOUT=12000ms
-      - API_PORT=8082
       - SERVICES=calc
       - CALC_PORT=18082
       - SERVICE_TTL=15
       - MAX_SERVICE_DIGEST=64
     ports:
       - "9002:9002/udp"
-      - "8082:8082"
+      - "9002:9002/tcp"
       - "18082:18082"
     restart: unless-stopped
 
@@ -100,20 +95,18 @@ services:
       - SELF_ID=node4
       - SELF_ADDR=node4:9003
       - REGISTRY_URL=registry:8089
-      - REGISTRY_JOIN_TIMEOUT=3s
       - SEEDS=
       - GOSSIP_INTERVAL=1400ms
       - HEARTBEAT_INTERVAL=1000ms
       - SUSPECT_TIMEOUT=5000ms
       - DEAD_TIMEOUT=12000ms
-      - API_PORT=8083
       - SERVICES=
       - CALC_PORT=18083
       - SERVICE_TTL=15
       - MAX_SERVICE_DIGEST=64
     ports:
       - "9003:9003/udp"
-      - "8083:8083"
+      - "9003:9003/tcp"
       - "18083:18083"
     restart: unless-stopped
 
@@ -125,20 +118,18 @@ services:
       - SELF_ID=node5
       - SELF_ADDR=node5:9004
       - REGISTRY_URL=registry:8089
-      - REGISTRY_JOIN_TIMEOUT=3s
       - SEEDS=
       - GOSSIP_INTERVAL=1400ms
       - HEARTBEAT_INTERVAL=1000ms
       - SUSPECT_TIMEOUT=5000ms
       - DEAD_TIMEOUT=12000ms
-      - API_PORT=8084
       - SERVICES=
       - CALC_PORT=18084
       - SERVICE_TTL=15
       - MAX_SERVICE_DIGEST=64
     ports:
       - "9004:9004/udp"
-      - "8084:8084"
+      - "9004:9004/tcp"
       - "18084:18084"
     restart: unless-stopped
 
@@ -150,20 +141,18 @@ services:
       - SELF_ID=node6
       - SELF_ADDR=node6:9005
       - REGISTRY_URL=registry:8089
-      - REGISTRY_JOIN_TIMEOUT=3s
       - SEEDS=
       - GOSSIP_INTERVAL=1400ms
       - HEARTBEAT_INTERVAL=1000ms
       - SUSPECT_TIMEOUT=5000ms
       - DEAD_TIMEOUT=12000ms
-      - API_PORT=8085
       - SERVICES=
       - CALC_PORT=18085
       - SERVICE_TTL=15
       - MAX_SERVICE_DIGEST=64
     ports:
       - "9005:9005/udp"
-      - "8085:8085"
+      - "9005:9005/tcp"
       - "18085:18085"
     restart: unless-stopped
 
@@ -175,20 +164,18 @@ services:
       - SELF_ID=node7
       - SELF_ADDR=node7:9006
       - REGISTRY_URL=registry:8089
-      - REGISTRY_JOIN_TIMEOUT=3s
       - SEEDS=
       - GOSSIP_INTERVAL=1400ms
       - HEARTBEAT_INTERVAL=1000ms
       - SUSPECT_TIMEOUT=5000ms
       - DEAD_TIMEOUT=12000ms
-      - API_PORT=8086
       - SERVICES=
       - CALC_PORT=18086
       - SERVICE_TTL=15
       - MAX_SERVICE_DIGEST=64
     ports:
       - "9006:9006/udp"
-      - "8086:8086"
+      - "9006:9006/tcp"
       - "18086:18086"
     restart: unless-stopped
 
