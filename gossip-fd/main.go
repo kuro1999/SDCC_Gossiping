@@ -77,25 +77,24 @@ type Member struct {
 }
 
 type MemberSummary struct {
-	ID           string      `json:"id"`
-	Addr         string      `json:"addr"`
-	Heartbeat    uint64      `json:"hb"`
-	State        MemberState `json:"state"`
-	LastSeenUnix int64       `json:"ls"`
+	ID          string      `json:"id"`
+	Addr        string      `json:"addr"`
+	Heartbeat   uint64      `json:"hb"`
+	Incarnation uint64      `json:"inc"`
+	State       MemberState `json:"state"`
 }
 
 // ---------------- Service Registry ----------------
 
 type ServiceAnnouncement struct {
-	Service         string `json:"service"` // es: "calc"
-	InstanceID      string `json:"id"`      // es: "node1-calc"
-	NodeID          string `json:"node"`    // chi ospita
-	Addr            string `json:"addr"`    // es: "node1:18080"
-	Version         uint64 `json:"ver"`     // contatore monotono
-	TTLSeconds      int    `json:"ttl"`     // es: 15
-	Up              bool   `json:"up"`      // true se attivo
-	LastUpdatedUnix int64  `json:"ts"`      // unix sec
-	Tombstone       bool   `json:"tomb"`    // per rimozione (non usato molto qui)
+	Service    string `json:"service"` // es: "calc"
+	InstanceID string `json:"id"`      // es: "node1-calc"
+	NodeID     string `json:"node"`    // chi ospita
+	Addr       string `json:"addr"`    // es: "node1:18080"
+	Version    uint64 `json:"ver"`     // contatore monotono
+	TTLSeconds int    `json:"ttl"`     // es: 15
+	Up         bool   `json:"up"`      // true se attivo
+	Tombstone  bool   `json:"tomb"`    // per rimozione (non usato molto qui)
 }
 
 type ServiceInstance struct {
@@ -121,7 +120,6 @@ type GossipMessage struct {
 	IsReply    bool                  `json:"is_reply"`
 	Membership []MemberSummary       `json:"membership"`
 	Services   []ServiceAnnouncement `json:"services"`
-	SentAtUnix int64                 `json:"sent_at"`
 }
 
 // ---------------- Config ----------------
@@ -261,11 +259,12 @@ func NewNode() (*Node, error) {
 
 	now := time.Now()
 	n.members[id] = &Member{
-		ID:        id,
-		Addr:      addr,
-		Heartbeat: 0,
-		LastSeen:  now,
-		State:     StateAlive,
+		ID:          id,
+		Addr:        addr,
+		Heartbeat:   0,
+		LastSeen:    now,
+		Incarnation: 1,
+		State:       StateAlive,
 	}
 
 	// seed peers (opzionali)
@@ -627,49 +626,176 @@ func (n *Node) sendImmediateGossip() {
 	}
 }
 
+// buildReplyDiff costruisce una reply "diff-only" senza usare timestamp.
+// Confronta solo heartbeat (membership) e version/up (services).
+func (n *Node) buildReplyDiff(gm *GossipMessage) GossipMessage {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// --- indicizza ciò che il mittente dichiara di sapere ---
+	seenHB := make(map[string]MemberSummary, len(gm.Membership))
+	for _, s := range gm.Membership {
+		seenHB[s.ID] = s
+	}
+	seenSvcVer := make(map[string]uint64, len(gm.Services))
+	seenSvcUp := make(map[string]bool, len(gm.Services))
+	for _, a := range gm.Services {
+		key := svcKey(a.Service, a.InstanceID)
+		seenSvcVer[key] = a.Version
+		seenSvcUp[key] = a.Up && !a.Tombstone
+	}
+
+	// --- membership: includi solo entry mancanti o con HB/stato più "forte" ---
+	ms := make([]MemberSummary, 0, len(n.members))
+	for _, m := range n.members {
+		s, ok := seenHB[m.ID]
+		need := !ok ||
+			m.Incarnation > s.Incarnation ||
+			(m.Incarnation == s.Incarnation && m.Heartbeat > s.Heartbeat) ||
+			(m.State == StateAlive && s.State != StateAlive)
+		if need {
+			ms = append(ms, MemberSummary{
+				ID:          m.ID,
+				Addr:        m.Addr,
+				Heartbeat:   m.Heartbeat,
+				Incarnation: m.Incarnation, // NEW
+				State:       m.State,
+			})
+		}
+	}
+
+	// Alive prima, poi heartbeat decrescente; fallback deterministico
+	sort.Slice(ms, func(i, j int) bool {
+		ai, aj := ms[i].State == StateAlive, ms[j].State == StateAlive
+		if ai != aj {
+			return ai && !aj
+		}
+		if ms[i].Incarnation != ms[j].Incarnation {
+			return ms[i].Incarnation > ms[j].Incarnation
+		}
+		if ms[i].Heartbeat != ms[j].Heartbeat {
+			return ms[i].Heartbeat > ms[j].Heartbeat
+		}
+		return ms[i].ID < ms[j].ID
+	})
+	if len(ms) > n.cfg.MaxDigestPeers {
+		ms = ms[:n.cfg.MaxDigestPeers]
+	}
+
+	// --- services: includi solo (service,instance) mancanti o con Version maggiore o flip di stato ---
+	sa := make([]ServiceAnnouncement, 0, len(n.services))
+	for _, s := range n.services {
+		key := svcKey(s.Service, s.InstanceID)
+		lastKnownVer := seenSvcVer[key]
+		lastKnownUp := seenSvcUp[key]
+		thisUp := s.Up && !s.Tombstone
+
+		if s.Version > lastKnownVer || thisUp != lastKnownUp {
+			ttl := s.TTLSeconds
+			if ttl <= 0 {
+				ttl = n.cfg.ServiceTTL // fallback locale; non dipende da orologi remoti
+			}
+			sa = append(sa, ServiceAnnouncement{
+				Service:    s.Service,
+				InstanceID: s.InstanceID,
+				NodeID:     s.NodeID,
+				Addr:       s.Addr,
+				Version:    s.Version,
+				TTLSeconds: ttl,
+				Up:         thisUp,
+				Tombstone:  s.Tombstone,
+			})
+		}
+	}
+
+	// Up prima, poi versione decrescente; fallback deterministico
+	sort.Slice(sa, func(i, j int) bool {
+		if sa[i].Up != sa[j].Up {
+			return sa[i].Up && !sa[j].Up
+		}
+		if sa[i].Version != sa[j].Version {
+			return sa[i].Version > sa[j].Version
+		}
+		if sa[i].Service != sa[j].Service {
+			return sa[i].Service < sa[j].Service
+		}
+		return sa[i].InstanceID < sa[j].InstanceID
+	})
+	if len(sa) > n.cfg.MaxServiceDigest {
+		sa = sa[:n.cfg.MaxServiceDigest]
+	}
+
+	return GossipMessage{
+		FromID:     n.cfg.SelfID,
+		ReturnAddr: n.cfg.SelfAddr,
+		IsReply:    true,
+		Membership: ms,
+		Services:   sa,
+	}
+}
+
 func (n *Node) buildMessage(isReply bool) GossipMessage {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	// membership digest
+	// --- membership digest (senza timestamp) ---
 	sums := make([]MemberSummary, 0, len(n.members))
 	for _, m := range n.members {
 		sums = append(sums, MemberSummary{
-			ID:           m.ID,
-			Addr:         m.Addr,
-			Heartbeat:    m.Heartbeat,
-			State:        m.State,
-			LastSeenUnix: m.LastSeen.Unix(),
+			ID:          m.ID,
+			Addr:        m.Addr,
+			Heartbeat:   m.Heartbeat,
+			Incarnation: m.Incarnation, // NEW
+			State:       m.State,
 		})
 	}
+
+	// Alive prima, poi heartbeat decrescente; fallback deterministico su Incarnation, hb
 	sort.Slice(sums, func(i, j int) bool {
-		ai := sums[i].State == StateAlive
-		aj := sums[j].State == StateAlive
+		ai, aj := sums[i].State == StateAlive, sums[j].State == StateAlive
 		if ai != aj {
 			return ai && !aj
 		}
-		return sums[i].LastSeenUnix > sums[j].LastSeenUnix
+		if sums[i].Incarnation != sums[j].Incarnation {
+			return sums[i].Incarnation > sums[j].Incarnation
+		}
+		if sums[i].Heartbeat != sums[j].Heartbeat {
+			return sums[i].Heartbeat > sums[j].Heartbeat
+		}
+		return sums[i].ID < sums[j].ID
 	})
 	if len(sums) > n.cfg.MaxDigestPeers {
 		sums = sums[:n.cfg.MaxDigestPeers]
 	}
 
-	// service digest: prendi le istanze più "recenti"
+	// --- service digest (senza timestamp) ---
 	sann := make([]ServiceAnnouncement, 0, len(n.services))
 	for _, s := range n.services {
 		sann = append(sann, ServiceAnnouncement{
-			Service:         s.Service,
-			InstanceID:      s.InstanceID,
-			NodeID:          s.NodeID,
-			Addr:            s.Addr,
-			Version:         s.Version,
-			TTLSeconds:      s.TTLSeconds,
-			Up:              s.Up,
-			LastUpdatedUnix: s.LastUpdated.Unix(),
-			Tombstone:       s.Tombstone,
+			Service:    s.Service,
+			InstanceID: s.InstanceID,
+			NodeID:     s.NodeID,
+			Addr:       s.Addr,
+			Version:    s.Version,
+			TTLSeconds: s.TTLSeconds, // ok: è una durata, non un timestamp
+			Up:         s.Up,
+			Tombstone:  s.Tombstone,
 		})
 	}
-	sort.Slice(sann, func(i, j int) bool { return sann[i].LastUpdatedUnix > sann[j].LastUpdatedUnix })
+
+	// Up prima, poi versione decrescente; fallback deterministico
+	sort.Slice(sann, func(i, j int) bool {
+		if sann[i].Up != sann[j].Up {
+			return sann[i].Up && !sann[j].Up
+		}
+		if sann[i].Version != sann[j].Version {
+			return sann[i].Version > sann[j].Version
+		}
+		if sann[i].Service != sann[j].Service {
+			return sann[i].Service < sann[j].Service
+		}
+		return sann[i].InstanceID < sann[j].InstanceID
+	})
 	if len(sann) > n.cfg.MaxServiceDigest {
 		sann = sann[:n.cfg.MaxServiceDigest]
 	}
@@ -680,7 +806,6 @@ func (n *Node) buildMessage(isReply bool) GossipMessage {
 		IsReply:    isReply,
 		Membership: sums,
 		Services:   sann,
-		SentAtUnix: time.Now().Unix(),
 	}
 }
 
@@ -711,22 +836,33 @@ func (n *Node) receiveLoop() {
 			continue
 		}
 
+		// merge prima di tutto
 		mu := n.mergeMembership(&gm)
 		su := n.mergeServices(&gm)
 
+		// --- PUSH-PULL a due passi: rispondi solo se NON è una reply ---
 		if !gm.IsReply {
-			reply := n.buildMessage(true)
-			ret := gm.ReturnAddr
+			ret := strings.TrimSpace(gm.ReturnAddr)
 			if ret == "" {
-				ret = src.String()
+				ret = src.String() // fallback prudente sull'indirizzo UDP sorgente
 			}
-			if err := n.sendTo(ret, reply); err != nil {
-				log.Printf("[REPLY-ERR] to %s: %v", ret, err)
+			// opzionale: evita di rispondere a te stesso
+			if ret != "" && ret != n.cfg.SelfAddr {
+				reply := n.buildReplyDiff(&gm)
+
+				// se la reply è vuota non inviare (micro-risparmio traffico)
+				if len(reply.Membership) > 0 || len(reply.Services) > 0 {
+					if err := n.sendTo(ret, reply); err != nil {
+						log.Printf("[REPLY-ERR] to %s: %v", ret, err)
+					} else {
+						// log.Printf("[REPLY] to=%s members=%d services=%d", ret, len(reply.Membership), len(reply.Services))
+					}
+				}
 			}
 		}
 
 		if mu+su > 0 {
-			//log.Printf("[MERGE] da=%s, membri=%d, servizi=%d", gm.FromID, mu, su)
+			// log.Printf("[MERGE] da=%s, membri=%d, servizi=%d", gm.FromID, mu, su)
 		}
 	}
 }
@@ -736,13 +872,30 @@ func (n *Node) receiveLoop() {
 func (n *Node) mergeMembership(gm *GossipMessage) int {
 	now := time.Now()
 	updated := 0
-	//log.Println("[SYNC] Acquisizione del mutex per merge dei membri")
-	n.mu.Lock()
-	defer func() {
-		n.mu.Unlock()
-		//log.Println("[SYNC] Mutex rilasciato dopo merge dei membri")
-	}()
 
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// --- SELF-BUMP: se i peer mi riportano con una inc >= della mia, salto avanti ---
+	self := n.members[n.cfg.SelfID]
+	for _, s := range gm.Membership {
+		if s.ID != n.cfg.SelfID {
+			continue
+		}
+		if s.Incarnation > self.Incarnation || (s.Incarnation == self.Incarnation && s.State != StateAlive) {
+			oldInc := self.Incarnation
+			self.Incarnation = s.Incarnation + 1 // NEW: nuova "vita"
+			self.Heartbeat = 0                   // riparti da 0
+			self.State = StateAlive
+			self.LastSeen = now
+			updated++
+			log.Printf("[SELF-BUMP] inc %d -> %d (refuting old view)", oldInc, self.Incarnation)
+			// spingi subito la notizia (opzionale ma consigliato)
+			n.onEventTrigger()
+		}
+	}
+
+	// --- mittente come prima (bootstrap morbido) ---
 	if gm.FromID != "" {
 		if _, ok := n.members[gm.FromID]; !ok {
 			n.members[gm.FromID] = &Member{
@@ -752,11 +905,18 @@ func (n *Node) mergeMembership(gm *GossipMessage) int {
 				LastSeen: now,
 			}
 			updated++
-			//log.Printf("[MERGE] Nuovo membro aggiunto: %s", gm.FromID)
+		} else if gm.ReturnAddr != "" && n.members[gm.FromID].Addr != gm.ReturnAddr {
+			n.members[gm.FromID].Addr = gm.ReturnAddr
+			updated++
 		}
 	}
 
+	// --- merge degli altri membri con ordine (inc, hb) ---
 	for _, s := range gm.Membership {
+		if s.ID == n.cfg.SelfID {
+			continue
+		} // già gestito sopra
+
 		m, ok := n.members[s.ID]
 		if !ok {
 			m = &Member{ID: s.ID, Addr: s.Addr}
@@ -764,30 +924,33 @@ func (n *Node) mergeMembership(gm *GossipMessage) int {
 			updated++
 			log.Printf("[MERGE] Nuovo membro aggiunto: %s", s.ID)
 		}
-		if s.Heartbeat > m.Heartbeat {
+		if s.Addr != "" && s.Addr != m.Addr {
+			m.Addr = s.Addr
+			updated++
+		}
+
+		// Accetta solo se (inc, hb) è più nuovo
+		if s.Incarnation > m.Incarnation ||
+			(s.Incarnation == m.Incarnation && s.Heartbeat > m.Heartbeat) {
 			old := m.State
-			m.State = StateAlive
+			m.Incarnation = s.Incarnation
 			m.Heartbeat = s.Heartbeat
+			m.State = StateAlive
 			m.LastSeen = now
-			if s.Addr != "" {
-				m.Addr = s.Addr
-			}
 			if old != StateAlive {
-				log.Printf("[RECOVER] %s: %s -> ALIVE (hb=%d)", s.ID, old, s.Heartbeat)
+				log.Printf("[RECOVER] %s: %s -> ALIVE (inc=%d hb=%d)", s.ID, old, s.Incarnation, s.Heartbeat)
 			}
 			updated++
-		} else if s.LastSeenUnix > 0 {
-			ls := time.Unix(s.LastSeenUnix, 0)
-			if ls.After(m.LastSeen) {
-				m.LastSeen = ls
-			}
 		}
+
+		// niente degradazioni su stato remoto: lasciale al tuo FD locale
 	}
+
 	return updated
 }
 
 func (n *Node) mergeServices(gm *GossipMessage) int {
-	now := time.Now()
+	now := time.Now() // usato solo localmente per l'ultimo "heard"
 	updated := 0
 
 	n.mu.Lock()
@@ -800,31 +963,36 @@ func (n *Node) mergeServices(gm *GossipMessage) int {
 		// monotonicità globale: scarta se la versione è <= dell'ultima vista
 		last := n.lastSvcVer[key]
 		if ann.Version <= last {
+			// NOTA: se vuoi che announce a stessa versione fungano da "keepalive",
+			// puoi rimuovere questo check o gestire un ramo speciale per il solo refresh del LastUpdated.
 			continue
 		}
-		// ridondante, ma sicuro: se esiste cur e la versione non supera cur.Version, ignora
+		// ridondante ma sicuro: se esiste cur e la versione non supera cur.Version, ignora
 		if ok && ann.Version <= cur.Version {
 			continue
 		}
 
-		// accetta annuncio
+		// normalizza TTL (durata locale, non timestamp)
+		ttl := ann.TTLSeconds
+		if ttl <= 0 {
+			ttl = n.cfg.ServiceTTL
+		}
+
+		up := ann.Up && !ann.Tombstone
 		inst := &ServiceInstance{
 			Service:     ann.Service,
 			InstanceID:  ann.InstanceID,
 			NodeID:      ann.NodeID,
 			Addr:        ann.Addr,
 			Version:     ann.Version,
-			TTLSeconds:  ann.TTLSeconds,
-			Up:          ann.Up && !ann.Tombstone,
+			TTLSeconds:  ttl,
+			Up:          up,
 			Tombstone:   ann.Tombstone,
-			LastUpdated: time.Unix(ann.LastUpdatedUnix, 0),
-		}
-		// normalizza LastUpdated
-		if inst.LastUpdated.IsZero() || inst.LastUpdated.After(now) {
-			inst.LastUpdated = now
+			LastUpdated: now, // solo clock locale
 		}
 
 		n.services[key] = inst
+
 		// aggiorna la waterline di versione
 		if ann.Version > n.lastSvcVer[key] {
 			n.lastSvcVer[key] = ann.Version
@@ -1303,11 +1471,12 @@ func (n *Node) printView() {
 
 	// ================== COSTRUZIONE RIGHE MEMBRI ==================
 	type row struct {
-		ID   string
-		St   MemberState
-		HB   uint64
-		Last string
-		Addr string
+		ID          string
+		St          MemberState
+		HB          uint64
+		Last        string
+		Addr        string
+		incarnation uint64
 	}
 
 	rows := make([]row, 0, len(canonical))
@@ -1325,11 +1494,12 @@ func (n *Node) printView() {
 		}
 
 		rows = append(rows, row{
-			ID:   m.ID,
-			St:   m.State,
-			HB:   m.Heartbeat,
-			Last: last,
-			Addr: addr,
+			ID:          m.ID,
+			St:          m.State,
+			HB:          m.Heartbeat,
+			Last:        last,
+			Addr:        addr,
+			incarnation: m.Incarnation,
 		})
 	}
 
@@ -1353,7 +1523,7 @@ func (n *Node) printView() {
 	log.Printf("[VIEW] ----- %s -----", n.cfg.SelfID)
 	for _, r := range rows {
 		// riga membro (solo canonici, niente alias duplicati)
-		log.Printf("  %-10s  %-7s  hb=%-6d  last=%-12s  %s", r.ID, r.St, r.HB, r.Last, r.Addr)
+		log.Printf("  %-10s  %-7s  hb=%-6d  last=%-12s  %s with inc=%d", r.ID, r.St, r.HB, r.Last, r.Addr, r.incarnation)
 
 		// servizi sotto il nodo (usiamo NodeID esatto)
 		if list := svcsByNode[r.ID]; len(list) > 0 {

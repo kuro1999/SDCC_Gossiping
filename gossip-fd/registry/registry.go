@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"strconv"
@@ -65,21 +67,39 @@ func (r *Registry) startRegistry(port int) {
 			}
 		}
 		r.mu.Unlock()
-		if len(peers) == 0 {
+
+		// Calcolo dinamico del numero di peer da restituire (log2(N) + 1)
+		N := len(peers)
+		k := int(math.Log2(float64(N))) + 1
+		if k > N {
+			k = N // Se k è maggiore del numero di peer, restituisci tutti
+		}
+		if k < 1 {
+			k = 1 // Assicurati che k sia almeno 1
+		}
+
+		// Se ci sono peer disponibili, seleziona k peer casuali
+		if N > 0 {
+			rand.Shuffle(len(peers), func(i, j int) {
+				peers[i], peers[j] = peers[j], peers[i]
+			})
+			peers = peers[:k] // Limitati ai primi k peer selezionati casualmente
+		}
+		if N == 0 {
 			log.Printf("no peers found, giving an empty list to node: %s", in.ID)
 		} else {
-			log.Printf("giving existing peers to %s: ", in.ID)
+			log.Printf("giving k=%d peers to %s: ", in.ID, k)
 			for _, id := range peers {
 				log.Printf("\t%s", id)
 			}
 		}
 
+		// Aggiungi il nuovo nodo al registro dopo avergli dato la lista dei peer
 		r.mu.Lock()
-		// Add the new node to the registry after given the list of peers in the network
 		r.nodes[in.ID] = &regEntry{ID: in.ID, Addr: in.Addr, LastSeen: time.Now()}
 		r.mu.Unlock()
 
-		// Respond with the list of peers
+		// Rispondi con la lista dei peer
 		resp := regJoinResp{Peers: peers}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
