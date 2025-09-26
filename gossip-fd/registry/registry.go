@@ -1,11 +1,8 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -16,12 +13,8 @@ import (
 )
 
 type Registry struct {
-	mu            sync.Mutex
-	nodes         map[string]*regEntry
-	votes         map[string]map[string]time.Time // suspectID -> (voterID -> ts)
-	ttl           time.Duration                   // opzionale per LastSeen (già presente)
-	voteTTL       time.Duration                   // durata massima di validità di un voto
-	notifyTimeout time.Duration                   // timeout per notifiche push ai nodi
+	mu    sync.Mutex
+	nodes map[string]*regEntry
 }
 
 type regEntry struct {
@@ -46,140 +39,10 @@ func (r *Registry) majorityLocked() (maj, total int) {
 	return
 }
 
-// notifyEviction invia la notifica di rimozione ai nodi target (best-effort, non bloccante).
-func (r *Registry) notifyEviction(suspectID string, targets []string) {
-	// corpo in JSON: { "id": "<suspectID>" }
-	body, _ := json.Marshal(struct {
-		ID string `json:"id"`
-	}{ID: suspectID})
-
-	for _, addr := range targets {
-		// invio in goroutine, con timeout per non bloccare il registry
-		go func(addr string) {
-			ctx, cancel := context.WithTimeout(context.Background(), r.notifyTimeout)
-			defer cancel()
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-				"http://"+addr+"/api/membership/evict", bytes.NewReader(body))
-			if err != nil {
-				log.Printf("[REGISTRY] notify build error to %s: %v", addr, err)
-				return
-			}
-			req.Header.Set("Content-Type", "application/json")
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				log.Printf("[REGISTRY] notify error to %s: %v", addr, err)
-				return
-			}
-			io.Copy(io.Discard, resp.Body)
-			_ = resp.Body.Close()
-		}(addr)
-	}
-}
-
 func (r *Registry) startRegistry(port int) {
 	r.nodes = make(map[string]*regEntry)
-	r.votes = make(map[string]map[string]time.Time)
-
-	// valori sensati di default; se vuoi, leggili da env
-	r.ttl = 90 * time.Second
-	r.voteTTL = 2 * r.ttl
-	r.notifyTimeout = 800 * time.Millisecond
 
 	mux := http.NewServeMux()
-
-	// POST /api/vote-dead
-	// Body: { "voter_id": "...", "suspect_id": "..." }
-	mux.HandleFunc("/api/vote-dead", func(w http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodPost {
-			http.Error(w, "use POST", http.StatusMethodNotAllowed)
-			return
-		}
-		var in struct {
-			VoterID   string `json:"voter_id"`
-			SuspectID string `json:"suspect_id"`
-		}
-		if err := json.NewDecoder(req.Body).Decode(&in); err != nil || in.VoterID == "" || in.SuspectID == "" {
-			http.Error(w, "bad body", http.StatusBadRequest)
-			return
-		}
-
-		now := time.Now()
-
-		r.mu.Lock()
-		// valida che il voter esista nel registry (evita voti di sconosciuti)
-		if _, ok := r.nodes[in.VoterID]; !ok {
-			r.mu.Unlock()
-			http.Error(w, "unknown voter", http.StatusBadRequest)
-			return
-		}
-
-		// crea bucket di voti per questo suspect se non esiste
-		if _, ok := r.votes[in.SuspectID]; !ok {
-			r.votes[in.SuspectID] = make(map[string]time.Time)
-		}
-
-		// scarta voti scaduti (vecchi) per questo suspect
-		cutoff := now.Add(-r.voteTTL)
-		for v, ts := range r.votes[in.SuspectID] {
-			if ts.Before(cutoff) {
-				delete(r.votes[in.SuspectID], v)
-			}
-		}
-
-		// registra il voto in modo idempotente (1 voto per voter->suspect)
-		if _, dup := r.votes[in.SuspectID][in.VoterID]; !dup {
-			r.votes[in.SuspectID][in.VoterID] = now
-			log.Printf("[REGISTRY] vote: %s -> suspect=%s", in.VoterID, in.SuspectID)
-		}
-
-		// calcola tally e maggioranza
-		maj, total := r.majorityLocked()
-		tally := len(r.votes[in.SuspectID])
-
-		// se si è raggiunta la maggioranza, rimuovi il suspect e notifica i nodi
-		evicted := false
-		var targets []string
-		if tally >= maj {
-			if _, present := r.nodes[in.SuspectID]; present {
-				// prepara target per la notifica (tutti meno il suspect)
-				for id, e := range r.nodes {
-					if id != in.SuspectID {
-						targets = append(targets, e.Addr)
-					}
-				}
-				delete(r.nodes, in.SuspectID)
-				delete(r.votes, in.SuspectID)
-				evicted = true
-				log.Printf("[REGISTRY] EVICT %s by majority", in.SuspectID)
-			} else {
-				// se non è più presente, pulisci i voti “orfani”
-				delete(r.votes, in.SuspectID)
-			}
-		}
-
-		// risposta JSON
-		resp := struct {
-			Tally    int  `json:"tally"`
-			Majority int  `json:"majority"`
-			Total    int  `json:"total"`
-			Evicted  bool `json:"evicted"`
-		}{
-			Tally:    tally,
-			Majority: maj,
-			Total:    total,
-			Evicted:  evicted,
-		}
-
-		r.mu.Unlock() // sblocca prima delle notifiche
-
-		// notifica best-effort fuori lock
-		if evicted && len(targets) > 0 {
-			go r.notifyEviction(in.SuspectID, targets)
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
-	})
 
 	// POST /api/join
 	mux.HandleFunc("/api/join", func(w http.ResponseWriter, req *http.Request) {

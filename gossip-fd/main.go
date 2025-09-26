@@ -164,9 +164,8 @@ type Node struct {
 	metricPeriodic uint64 // # batch gossip inviati per motivo "periodic"
 	metricEvent    uint64 // # batch gossip inviati per motivo "event"
 	//registry
-	RegistryURL string
-	httpClient  *http.Client    // client HTTP con timeout
-	votedDead   map[string]bool // chiave: peerID -> ho già votato DEAD per questo ciclo
+
+	httpClient *http.Client // client HTTP con timeout
 }
 
 // ---------------- Utilità env ----------------
@@ -201,45 +200,6 @@ func parseIntEnv(key string, def int) int {
 		return def
 	}
 	return n
-}
-
-// voteDead invia un singolo voto al registry per rimuovere "suspectID".
-// Viene chiamata SOLO al cambio di stato a DEAD (transizione), quindi è già unica.
-func (n *Node) voteDead(suspectID string) {
-	if suspectID == "" || suspectID == n.cfg.SelfID {
-		return
-	}
-	url := fmt.Sprintf("http://%s/api/vote-dead", n.cfg.RegistryURL)
-	body := map[string]string{
-		"voter_id":   n.cfg.SelfID,
-		"suspect_id": suspectID,
-	}
-	b, _ := json.Marshal(body)
-
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(b))
-	if err != nil {
-		log.Printf("[VOTE] build err suspect=%s: %v", suspectID, err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := n.httpClient.Do(req)
-	if err != nil {
-		log.Printf("[VOTE] http err suspect=%s: %v", suspectID, err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("[VOTE] bad status suspect=%s: %d", suspectID, resp.StatusCode)
-		return
-	}
-	var out struct {
-		Tally, Majority, Total int
-		Evicted                bool
-	}
-	_ = json.NewDecoder(resp.Body).Decode(&out)
-	log.Printf("[VOTE] %s tally=%d/%d evicted=%v", suspectID, out.Tally, out.Evicted)
 }
 
 // ---------------- Node init ----------------
@@ -294,9 +254,6 @@ func NewNode() (*Node, error) {
 
 	// Client HTTP riusabile con timeout
 	n.httpClient = &http.Client{Timeout: 1 * time.Second}
-	// Voto unico per peer: flag per non votare due volte nella stessa “vita”
-	n.votedDead = make(map[string]bool)
-
 	if EnableEventGossip {
 		n.eventCh = make(chan struct{}, 64) // buffer per non bloccare
 	}
@@ -527,31 +484,6 @@ func (n *Node) suspicionLoop() {
 		n.mu.Unlock()
 		// --- fine sezione critica ---
 
-		// deriva insiemi per voto/reset UNA VOLTA SOLA (fuori lock)
-		var toVote, toReset []string
-		for _, x := range transitions {
-			if x.new == StateDead && x.id != n.cfg.SelfID {
-				toVote = append(toVote, x.id)
-			}
-			if x.new == StateAlive {
-				toReset = append(toReset, x.id)
-			}
-		}
-
-		// aggiorna flag di voto con lock breve; decide chi votare ora
-		var fireVotes []string
-		n.mu.Lock()
-		for _, id := range toReset {
-			delete(n.votedDead, id) // se è tornato ALIVE, potremo rivotarlo in futuro
-		}
-		for _, id := range toVote {
-			if !n.votedDead[id] { // voto unico per questo ciclo di vita
-				n.votedDead[id] = true
-				fireVotes = append(fireVotes, id)
-			}
-		}
-		n.mu.Unlock()
-
 		// logging delle transizioni (fuori lock)
 		for _, x := range transitions {
 			log.Printf("[STATE] %s -> %s (peer=%s, lastSeen=%s, Δ=%s)",
@@ -559,11 +491,6 @@ func (n *Node) suspicionLoop() {
 			if x.new == StateDead {
 				log.Printf("[EVENTO] Nodo %s è diventato DEAD. Scatenato gossip immediato.", x.id)
 			}
-		}
-
-		// invia i voti (best-effort) fuori dal lock
-		for _, sid := range fireVotes {
-			go n.voteDead(sid)
 		}
 
 		// trigger degli eventi (una volta per ogni passaggio a DEAD)
@@ -1052,51 +979,6 @@ func (n *Node) serviceRefreshLoop() {
 
 func (n *Node) startDiscoveryAPI(port int) {
 	mux := http.NewServeMux()
-
-	// --- POST /api/membership/evict ---
-	// Body: { "id": "<nodeID>" }
-	// Effetto: rimuove subito il nodo dalla membership e cancella i suoi servizi.
-	// Non usiamo quarantene/ban-list: evict è immediato e basta.
-	mux.HandleFunc("/api/membership/evict", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "use POST", http.StatusMethodNotAllowed)
-			return
-		}
-		var in struct {
-			ID string `json:"id"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&in); err != nil || strings.TrimSpace(in.ID) == "" {
-			http.Error(w, "bad body", http.StatusBadRequest)
-			return
-		}
-		if in.ID == n.cfg.SelfID {
-			log.Printf("[EVICT] ignorato evict su self (%s)", in.ID)
-			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
-			return
-		}
-
-		n.mu.Lock()
-		// rimuovi dalla membership
-		delete(n.members, in.ID)
-		// rimuovi tutti i servizi ospitati da quel nodo
-		for k, s := range n.services {
-			if s.NodeID == in.ID {
-				delete(n.services, k)
-			}
-		}
-		// opzionale: resetta il flag di voto per permettere futuri cicli (se rientra)
-		delete(n.votedDead, in.ID)
-		n.mu.Unlock()
-
-		log.Printf("[EVICT] applicato evict per %s (rimosso da membership e servizi)", in.ID)
-
-		// opzionale: diffondi subito la nuova view
-		n.onEventTrigger()
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
-	})
-
 	// --- POST /service/register ---
 	// Aggiunge/refresh-a un'istanza locale e (se abilitato) scatena gossip immediato.
 	mux.HandleFunc("/service/register", func(w http.ResponseWriter, r *http.Request) {
