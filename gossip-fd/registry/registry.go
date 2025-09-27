@@ -80,18 +80,16 @@ func (r *Registry) startRegistry(port int) {
 
 		// Se ci sono peer disponibili, seleziona k peer casuali
 		if N > 0 {
-			rand.Shuffle(len(peers), func(i, j int) {
-				peers[i], peers[j] = peers[j], peers[i]
-			})
-			peers = peers[:k] // Limitati ai primi k peer selezionati casualmente
-		}
-		if N == 0 {
-			log.Printf("no peers found, giving an empty list to node: %s", in.ID)
-		} else {
-			log.Printf("giving k=%d peers to %s: ", in.ID, k)
-			for _, id := range peers {
-				log.Printf("\t%s", id)
+			rand.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
+			if len(peers) >= k { // <-- guardia extra
+				peers = peers[:k]
 			}
+			log.Printf("giving k=%d peers to %s:", k, in.ID) // <-- ordine fix
+			for _, p := range peers {
+				log.Printf("\t%s", p)
+			}
+		} else {
+			log.Printf("no peers found, giving an empty list to node: %s", in.ID)
 		}
 
 		// Aggiungi il nuovo nodo al registro dopo avergli dato la lista dei peer

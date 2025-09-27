@@ -53,6 +53,52 @@ const (
 	StateDead    MemberState = "DEAD"
 )
 
+// =================== DEATH CERTIFICATES: TIPI WIRE ===================
+
+// Evidenza di morte = "quanto è aggiornata la mia vista su X"
+type DeathEvidence struct {
+	Inc uint64 `json:"inc"` // incarnation osservata al momento della morte
+	Hb  uint64 `json:"hb"`  // heartbeat associato
+}
+
+// Voto di un witness: "io W dichiaro morto X con evidenza E in istante Ts"
+type DeathVote struct {
+	Target  string `json:"target"` // ID del nodo morto (X)
+	Inc     uint64 `json:"inc"`
+	Hb      uint64 `json:"hb"`
+	Witness string `json:"w"`  // ID del witness (mittente originario del voto)
+	Ts      int64  `json:"ts"` // unix seconds del voto
+}
+
+// Certificato (obituary): "si è raggiunto quorum K su X con evidenza E"
+// iat/ttl servono a evitare rigenerazioni infinite (il TTL non si resetta).
+type Obituary struct {
+	Target   string `json:"target"`
+	Inc      uint64 `json:"inc"`
+	Hb       uint64 `json:"hb"`
+	IssuedAt int64  `json:"iat"` // unix seconds di emissione iniziale
+	TtlSec   int    `json:"ttl"` // durata totale del certificato
+	K        int    `json:"k"`   // quorum raggiunto
+}
+
+// ====== Stato locale per voti/certificati ======
+
+// bucket dei voti ricevuti su un target X
+type voteBucket struct {
+	Evidence  DeathEvidence    // evidenza massima vista per X
+	Witness   map[string]int64 // witnessID -> ts unix (solo per finestra Δ)
+	ExpiresAt time.Time        // scadenza del bucket (Δ)
+	Priority  int              // round di priorità residui per piggyback voti
+}
+
+// certificato attivo da ridiffondere
+type obitEntry struct {
+	Evidence  DeathEvidence
+	IssuedAt  int64     // unix seconds dell'emissione originale (preservato)
+	ExpiresAt time.Time // IssuedAt + ObitTTL
+	Priority  int       // round di priorità residui per piggyback obits
+}
+
 // ---------------- Membership ----------------
 
 type Member struct {
@@ -108,6 +154,10 @@ type GossipMessage struct {
 	IsReply    bool                  `json:"is_reply"`
 	Membership []MemberSummary       `json:"membership"`
 	Services   []ServiceAnnouncement `json:"services"`
+
+	// NEW: piggyback di voti e certificati
+	Votes []DeathVote `json:"votes,omitempty"`
+	Obits []Obituary  `json:"obits,omitempty"`
 }
 
 // ---------------- Config ----------------
@@ -130,6 +180,14 @@ type Config struct {
 
 	//registry
 	RegistryURL string
+	// ====== Death certificates a quorum ======
+	QuorumK            int           // numero di witness richiesti (K)
+	VoteWindow         time.Duration // finestra di raccolta voti (Δ)
+	ObitTTL            time.Duration // durata di validità del certificato
+	MaxVoteDigest      int           // max voti piggyback per messaggio
+	MaxObitDigest      int           // max obituaries piggyback per messaggio
+	ObitPriorityRounds int           // round consecutivi in cui gli obits sono prioritari
+	VotePriorityRounds int           // round consecutivi in cui i voti sono prioritari
 }
 
 type Node struct {
@@ -146,6 +204,11 @@ type Node struct {
 	//registry
 
 	httpClient *http.Client // client HTTP con timeout
+
+	// ====== NEW: meta per eviction by quorum ======
+	votes           map[string]*voteBucket // key = targetID
+	obits           map[string]*obitEntry  // key = targetID
+	recentlyEvicted map[string]time.Time   // anti-rumore log/cleanup
 }
 
 // ---------------- Utilità env ----------------
@@ -182,6 +245,324 @@ func parseIntEnv(key string, def int) int {
 	return n
 }
 
+// =============== Helper per death certificates ===============
+
+// confronto lessicografico su (Inc, Hb)
+func evidenceNewer(a, b DeathEvidence) bool {
+	if a.Inc != b.Inc {
+		return a.Inc > b.Inc
+	}
+	return a.Hb > b.Hb
+}
+
+// registra un voto locale quando porti X a DEAD
+func (n *Node) recordLocalVote(target string, ev DeathEvidence) {
+	now := time.Now()
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// ignora auto-voto su me stesso per sicurezza
+	if target == n.cfg.SelfID {
+		return
+	}
+
+	b, ok := n.votes[target]
+	if !ok {
+		b = &voteBucket{
+			Evidence:  ev,
+			Witness:   make(map[string]int64),
+			ExpiresAt: now.Add(n.cfg.VoteWindow),
+			Priority:  n.cfg.VotePriorityRounds,
+		}
+		n.votes[target] = b
+	}
+	// mantieni l'evidenza massima
+	if evidenceNewer(ev, b.Evidence) {
+		b.Evidence = ev
+	}
+	// aggiorna finestra Δ e witness set
+	b.ExpiresAt = now.Add(n.cfg.VoteWindow)
+	b.Witness[n.cfg.SelfID] = now.Unix()
+	if b.Priority < n.cfg.VotePriorityRounds {
+		b.Priority = n.cfg.VotePriorityRounds
+	}
+}
+
+// ingest dei certificati: applica prima dei merge
+func (n *Node) ingestObits(obits []Obituary) (evicted int) {
+	now := time.Now()
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	for _, o := range obits {
+		// scarta obit scaduti (rispetta iat originale)
+		exp := time.Unix(o.IssuedAt, 0).Add(time.Duration(o.TtlSec) * time.Second)
+		if now.After(exp) {
+			continue
+		}
+
+		// se ho ALIVE più "nuovo" dell'evidenza del certificato, ignoro
+		if m, ok := n.members[o.Target]; ok && m.State == StateAlive {
+			local := DeathEvidence{Inc: m.Incarnation, Hb: m.Heartbeat}
+			// se local > obit.Evidence => obit è vecchio rispetto alla mia vista
+			log.Printf("[OBIT-IGNORE] target=%s ignorato (local ALIVE inc=%d hb=%d > cert inc=%d hb=%d)",
+				o.Target, m.Incarnation, m.Heartbeat, o.Inc, o.Hb)
+			if evidenceNewer(local, DeathEvidence{Inc: o.Inc, Hb: o.Hb}) {
+				continue
+			}
+		}
+
+		// esegui eviction (membro + servizi)
+		n.evictMemberLocked(o.Target)
+
+		// memorizza l'obit per ridiffusione (preserva IssuedAt)
+		entry, ok := n.obits[o.Target]
+		if !ok {
+			entry = &obitEntry{
+				Evidence:  DeathEvidence{Inc: o.Inc, Hb: o.Hb},
+				IssuedAt:  o.IssuedAt,
+				ExpiresAt: exp,
+				Priority:  n.cfg.ObitPriorityRounds,
+			}
+			n.obits[o.Target] = entry
+		} else {
+			// aggiorna eventuale evidenza se più forte
+			ev := DeathEvidence{Inc: o.Inc, Hb: o.Hb}
+			if evidenceNewer(ev, entry.Evidence) {
+				entry.Evidence = ev
+			}
+			if exp.After(entry.ExpiresAt) {
+				entry.ExpiresAt = exp
+			}
+			if entry.Priority < n.cfg.ObitPriorityRounds {
+				entry.Priority = n.cfg.ObitPriorityRounds
+			}
+		}
+		evicted++
+	}
+	return
+}
+
+// ingest dei voti: aggiorna bucket e promuove a certificato se quorum
+func (n *Node) ingestVotes(votes []DeathVote) (promoted int) {
+	now := time.Now()
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	for _, v := range votes {
+		// voto scaduto rispetto a Δ
+		if now.Sub(time.Unix(v.Ts, 0)) > n.cfg.VoteWindow {
+			continue
+		}
+		b, ok := n.votes[v.Target]
+		if !ok {
+			b = &voteBucket{
+				Evidence:  DeathEvidence{Inc: v.Inc, Hb: v.Hb},
+				Witness:   make(map[string]int64),
+				ExpiresAt: now.Add(n.cfg.VoteWindow),
+				Priority:  n.cfg.VotePriorityRounds,
+			}
+			log.Printf("[VOTE] creato bucket per %s (inc=%d hb=%d, Δ=%s)", v.Target, v.Inc, v.Hb, n.cfg.VoteWindow)
+			n.votes[v.Target] = b
+		}
+		// mantieni evidenza massima
+		ev := DeathEvidence{Inc: v.Inc, Hb: v.Hb}
+		if evidenceNewer(ev, b.Evidence) {
+			b.Evidence = ev
+		}
+		// aggiorna finestra Δ e witness set
+		b.ExpiresAt = now.Add(n.cfg.VoteWindow)
+		b.Witness[v.Witness] = v.Ts
+		log.Printf("[VOTE] witness=%s per %s (|W|=%d/%d)", v.Witness, v.Target, len(b.Witness), n.cfg.QuorumK)
+		if b.Priority < n.cfg.VotePriorityRounds {
+			b.Priority = n.cfg.VotePriorityRounds
+		}
+
+		// quorum raggiunto?
+		if len(b.Witness) >= n.cfg.QuorumK {
+			log.Printf("[OBIT] quorum raggiunto per %s (K=%d, inc=%d hb=%d) → certificato emesso (TTL=%s)",
+				v.Target, n.cfg.QuorumK, b.Evidence.Inc, b.Evidence.Hb, n.cfg.ObitTTL)
+			// promuovi a obit (una sola volta)
+			if _, exists := n.obits[v.Target]; !exists {
+				iat := now.Unix()
+				n.obits[v.Target] = &obitEntry{
+					Evidence:  b.Evidence,
+					IssuedAt:  iat,
+					ExpiresAt: time.Unix(iat, 0).Add(n.cfg.ObitTTL),
+					Priority:  n.cfg.ObitPriorityRounds,
+				}
+				promoted++
+			}
+		}
+	}
+	return
+}
+
+// selezione obits da piggybackare (con priorità e cappi)
+func (n *Node) selectObitsLocked(max int) []Obituary {
+	now := time.Now()
+	if max <= 0 {
+		return nil
+	}
+	type rec struct {
+		id string
+		*obitEntry
+	}
+	list := make([]rec, 0, len(n.obits))
+	for id, e := range n.obits {
+		if now.After(e.ExpiresAt) {
+			continue
+		}
+		list = append(list, rec{id: id, obitEntry: e})
+	}
+	// ordina per priorità prima
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].Priority != list[j].Priority {
+			return list[i].Priority > list[j].Priority
+		}
+		return list[i].ExpiresAt.Before(list[j].ExpiresAt)
+	})
+	if len(list) > max {
+		list = list[:max]
+	}
+	out := make([]Obituary, 0, len(list))
+	for _, r := range list {
+		out = append(out, Obituary{
+			Target:   r.id,
+			Inc:      r.Evidence.Inc,
+			Hb:       r.Evidence.Hb,
+			IssuedAt: r.IssuedAt,
+			TtlSec:   int(n.cfg.ObitTTL.Seconds()),
+			K:        n.cfg.QuorumK,
+		})
+		// consuma un round di priorità
+		if r.Priority > 0 {
+			r.Priority--
+		}
+	}
+	return out
+}
+
+// selezione voti da piggybackare (campiona gli witness per target)
+func (n *Node) selectVotesLocked(max int) []DeathVote {
+	now := time.Now()
+	if max <= 0 || len(n.votes) == 0 {
+		return nil
+	}
+	type rec struct {
+		target string
+		*voteBucket
+	}
+	bks := make([]rec, 0, len(n.votes))
+	for id, b := range n.votes {
+		if now.After(b.ExpiresAt) {
+			continue
+		}
+		bks = append(bks, rec{target: id, voteBucket: b})
+	}
+	if len(bks) == 0 {
+		return nil
+	}
+	// quante entry per target?
+	per := int(math.Max(1, math.Ceil(float64(max)/float64(len(bks)))))
+
+	out := make([]DeathVote, 0, max)
+	for _, r := range bks {
+		// estrai witness in ordine casuale
+		ws := make([]string, 0, len(r.Witness))
+		for w := range r.Witness {
+			ws = append(ws, w)
+		}
+		rand.Shuffle(len(ws), func(i, j int) { ws[i], ws[j] = ws[j], ws[i] })
+		take := per
+		for _, w := range ws {
+			if take == 0 || len(out) >= max {
+				break
+			}
+			ts := r.Witness[w]
+			// scarta voti vecchi oltre Δ
+			if now.Sub(time.Unix(ts, 0)) > n.cfg.VoteWindow {
+				continue
+			}
+			out = append(out, DeathVote{
+				Target:  r.target,
+				Inc:     r.Evidence.Inc,
+				Hb:      r.Evidence.Hb,
+				Witness: w,
+				Ts:      ts,
+			})
+			take--
+		}
+		// consuma round di priorità a livello bucket
+		if r.Priority > 0 {
+			r.Priority--
+		}
+		if len(out) >= max {
+			break
+		}
+	}
+	return out
+}
+
+// eviction "hard" (membro e servizi), da chiamare sotto lock
+func (n *Node) evictMemberLocked(id string) {
+	now := time.Now()
+	if _, ok := n.members[id]; ok {
+		delete(n.members, id)
+		// ripulisci servizi ospitati da quel nodo
+		for k, s := range n.services {
+			if s.NodeID == id {
+				delete(n.services, k)
+			}
+		}
+		n.recentlyEvicted[id] = now
+		log.Printf("[EVICT] rimosso %s per certificato/quorum", id)
+	}
+}
+
+// GC periodico per voti/obits
+func (n *Node) gcDeathMeta() {
+	now := time.Now()
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	for id, b := range n.votes {
+		if now.After(b.ExpiresAt) {
+			delete(n.votes, id)
+		}
+	}
+	for id, e := range n.obits {
+		if now.After(e.ExpiresAt) {
+			delete(n.obits, id)
+		}
+	}
+	// pulizia anti-rumore log
+	for id, t := range n.recentlyEvicted {
+		if now.Sub(t) > 1*time.Minute {
+			delete(n.recentlyEvicted, id)
+		}
+	}
+	removedVotes, removedObits := 0, 0
+	for id, b := range n.votes {
+		if now.After(b.ExpiresAt) {
+			delete(n.votes, id)
+			removedVotes++
+		}
+	}
+	for id, e := range n.obits {
+		if now.After(e.ExpiresAt) {
+			delete(n.obits, id)
+			removedObits++
+		}
+	}
+	if removedVotes > 0 || removedObits > 0 {
+		log.Printf("[DEATH-GC] rimossi votes=%d obits=%d", removedVotes, removedObits)
+	}
+}
+
 // ---------------- Node init ----------------
 
 func NewNode() (*Node, error) {
@@ -216,6 +597,14 @@ func NewNode() (*Node, error) {
 		ServiceTTL:        parseIntEnv("SERVICE_TTL", 15),
 		MaxServiceDigest:  parseIntEnv("MAX_SERVICE_DIGEST", 64),
 		RegistryURL:       mustEnv("REGISTRY_URL", "registry:8089"), // <-- da env
+		// ====== Death certificates defaults ======
+		QuorumK:            parseIntEnv("QUORUM_K", 2),
+		VoteWindow:         parseDurationEnv("VOTE_WINDOW", 6*time.Second), // ~ DeadTimeout
+		ObitTTL:            parseDurationEnv("OBIT_TTL", 18*time.Second),   // 3× DeadTimeout
+		MaxVoteDigest:      parseIntEnv("MAX_VOTE_DIGEST", 16),
+		MaxObitDigest:      parseIntEnv("MAX_OBIT_DIGEST", 8),
+		ObitPriorityRounds: parseIntEnv("OBIT_PRIORITY_ROUNDS", 3),
+		VotePriorityRounds: parseIntEnv("VOTE_PRIORITY_ROUNDS", 2),
 	}
 
 	udpAddr := net.UDPAddr{IP: net.IPv4zero, Port: port}
@@ -231,6 +620,9 @@ func NewNode() (*Node, error) {
 		services: make(map[string]*ServiceInstance),
 		udpPort:  port,
 	}
+	n.votes = make(map[string]*voteBucket)
+	n.obits = make(map[string]*obitEntry)
+	n.recentlyEvicted = make(map[string]time.Time)
 
 	// Client HTTP riusabile con timeout
 	n.httpClient = &http.Client{Timeout: 1 * time.Second}
@@ -427,6 +819,14 @@ func (n *Node) suspicionLoop() {
 		var transitions []tr
 		deadTriggers := 0
 
+		// NEW: raccoglitore dei peer appena diventati DEAD con la loro evidenza (inc,hb)
+		type deadEv struct {
+			id  string
+			inc uint64
+			hb  uint64
+		}
+		var localDead []deadEv
+
 		// --- sezione critica minima ---
 		n.mu.Lock()
 		for id, m := range n.members {
@@ -454,7 +854,14 @@ func (n *Node) suspicionLoop() {
 				transitions = append(transitions, tr{
 					old: old, new: newSt, id: id, lastSeen: m.LastSeen, delta: d,
 				})
+
+				// NEW: se passa a DEAD, snapshotta l'evidenza per emettere un voto (fuori lock)
 				if newSt == StateDead {
+					localDead = append(localDead, deadEv{
+						id:  id,
+						inc: m.Incarnation,
+						hb:  m.Heartbeat,
+					})
 					deadTriggers++
 				}
 			}
@@ -467,8 +874,18 @@ func (n *Node) suspicionLoop() {
 			log.Printf("[STATE] %s -> %s (peer=%s, lastSeen=%s, Δ=%s)",
 				x.old, x.new, x.id, x.lastSeen.Format(time.RFC3339), x.delta.Truncate(time.Millisecond))
 			if x.new == StateDead {
-				log.Printf("[EVENTO] Nodo %s è diventato DEAD. Scatenato gossip immediato.", x.id)
+				// Aggiorna il messaggio: niente immediate gossip, ora usiamo piggyback con priorità
+				log.Printf("[EVENTO] Nodo %s è diventato DEAD. Emesso voto locale (piggyback nei prossimi round).", x.id)
 			}
+		}
+		// NEW: emetti i voti locali (uno per ciascun peer appena marcato DEAD)
+		for _, d := range localDead {
+			n.recordLocalVote(d.id, DeathEvidence{Inc: d.inc, Hb: d.hb})
+			// LOG: voto locale emesso
+			log.Printf("[VOTE] emesso voto locale per %s (inc=%d hb=%d)", d.id, d.inc, d.hb)
+		}
+		if len(localDead) > 0 {
+			log.Printf("[VOTE] emessi %d voti locali (Δ=%s, K=%d)", len(localDead), n.cfg.VoteWindow, n.cfg.QuorumK)
 		}
 
 		// scadenze servizi (fa lock al suo interno)
@@ -484,6 +901,7 @@ func (n *Node) gossipLoop() {
 		select {
 		case <-t.C:
 			n.sendGossip("periodic")
+			n.gcDeathMeta() // pulizia voti/obits scaduti ad ogni tick
 		}
 	}
 }
@@ -527,33 +945,6 @@ func (n *Node) sendGossip(origin string) {
 				log.Printf("[GOSSIP][%s] send-err addr=%s err=%v", origin, a, err)
 			}
 		}(addr)
-	}
-}
-
-// Funzione che invia il gossip immediato quando si verifica un evento critico
-func (n *Node) sendImmediateGossip() {
-	log.Println("[GOSSIP IMMEDIATO] Gossip inviato immediatamente a causa di un evento critico.")
-
-	// Calcola il fanout dinamico
-	fanoutK := n.calculateDynamicFanout()
-
-	// Seleziona i nodi target in base al fanout dinamico
-	targets := n.pickRandomTargets(fanoutK)
-	if len(targets) == 0 {
-		log.Println("[GOSSIP IMMEDIATO] Nessun nodo disponibile per inviare gossip.")
-		return
-	}
-
-	// Costruisci il messaggio da inviare
-	msg := n.buildMessage(false /* isReply */)
-
-	// Invia i messaggi ai nodi target in modo concorrente
-	for _, peer := range targets {
-		go func(p *Member) {
-			if err := n.sendTo(p.Addr, msg); err != nil {
-				log.Printf("[SEND-ERR] to %s: %v", p.Addr, err)
-			}
-		}(peer)
 	}
 }
 
@@ -638,6 +1029,8 @@ func (n *Node) buildReplyDiff(gm *GossipMessage) GossipMessage {
 			})
 		}
 	}
+	obits := n.selectObitsLocked(n.cfg.MaxObitDigest)
+	votes := n.selectVotesLocked(n.cfg.MaxVoteDigest)
 
 	// Up prima, poi versione decrescente; fallback deterministico
 	sort.Slice(sa, func(i, j int) bool {
@@ -662,6 +1055,8 @@ func (n *Node) buildReplyDiff(gm *GossipMessage) GossipMessage {
 		IsReply:    true,
 		Membership: ms,
 		Services:   sa,
+		Obits:      obits, // NEW
+		Votes:      votes, // NEW
 	}
 }
 
@@ -730,6 +1125,9 @@ func (n *Node) buildMessage(isReply bool) GossipMessage {
 	if len(sann) > n.cfg.MaxServiceDigest {
 		sann = sann[:n.cfg.MaxServiceDigest]
 	}
+	// ====== piggyback obits e votes ======
+	obits := n.selectObitsLocked(n.cfg.MaxObitDigest)
+	votes := n.selectVotesLocked(n.cfg.MaxVoteDigest)
 
 	return GossipMessage{
 		FromID:     n.cfg.SelfID,
@@ -737,6 +1135,8 @@ func (n *Node) buildMessage(isReply bool) GossipMessage {
 		IsReply:    isReply,
 		Membership: sums,
 		Services:   sann,
+		Obits:      obits, // NEW
+		Votes:      votes, // NEW
 	}
 }
 
@@ -767,11 +1167,42 @@ func (n *Node) receiveLoop() {
 			continue
 		}
 
-		// merge prima di tutto
+		// 1) Applica prima i certificati e i voti (possono causare eviction/promozioni a certificato)
+		obitsApplied := n.ingestObits(gm.Obits)
+		votesPromoted := n.ingestVotes(gm.Votes)
+		if obitsApplied > 0 || votesPromoted > 0 {
+			log.Printf("[DEATH] obits_applied=%d, obits_promoted=%d (da %s)", obitsApplied, votesPromoted, gm.FromID)
+		}
+
+		// 2) FILTRO anti-resurrezione: rimuovi dal digest membership le entry coperte da obit attivo
+		filtered := 0
+		func() {
+			n.mu.Lock()
+			defer n.mu.Unlock()
+			now := time.Now()
+
+			dst := gm.Membership[:0]
+			for _, s := range gm.Membership {
+				if e, ok := n.obits[s.ID]; ok && now.Before(e.ExpiresAt) {
+					// se l'evidenza del digest NON è più nuova del certificato, scarta l'entry
+					if !evidenceNewer(DeathEvidence{Inc: s.Incarnation, Hb: s.Heartbeat}, e.Evidence) {
+						filtered++
+						continue
+					}
+				}
+				dst = append(dst, s)
+			}
+			gm.Membership = dst
+		}()
+		if filtered > 0 {
+			log.Printf("[DEATH] filtrate %d entry membership coperte da obit attivo (da %s)", filtered, gm.FromID)
+		}
+
+		// 3) Merge come prima
 		mu := n.mergeMembership(&gm)
 		su := n.mergeServices(&gm)
 
-		// --- PUSH-PULL a due passi: rispondi solo se NON è una reply ---
+		// 4) PUSH-PULL a due passi: rispondi solo se NON è una reply
 		if !gm.IsReply {
 			ret := strings.TrimSpace(gm.ReturnAddr)
 			if ret == "" {
@@ -780,15 +1211,15 @@ func (n *Node) receiveLoop() {
 			// opzionale: evita di rispondere a te stesso
 			if ret != "" && ret != n.cfg.SelfAddr {
 				reply := n.buildReplyDiff(&gm)
-
-				// se la reply è vuota non inviare (micro-risparmio traffico)
-				if len(reply.Membership) > 0 || len(reply.Services) > 0 {
+				if len(reply.Membership) > 0 || len(reply.Services) > 0 || len(reply.Obits) > 0 || len(reply.Votes) > 0 {
 					if err := n.sendTo(ret, reply); err != nil {
 						log.Printf("[REPLY-ERR] to %s: %v", ret, err)
 					} else {
-						// log.Printf("[REPLY] to=%s members=%d services=%d", ret, len(reply.Membership), len(reply.Services))
+						log.Printf("[REPLY] to=%s members=%d services=%d obits=%d votes=%d",
+							ret, len(reply.Membership), len(reply.Services), len(reply.Obits), len(reply.Votes))
 					}
 				}
+
 			}
 		}
 
