@@ -16,7 +16,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -33,11 +32,6 @@ import (
 
   - Demo service: "calc" HTTP con /sum e /sub opzionali per la prova end-to-end.
 */
-// ===== EXPERIMENT TOGGLES (cambia solo qui tra le run) =====
-const (
-	EnablePeriodicGossip = true  // RUN A: solo periodico -> true; RUN B: true
-	EnableEventGossip    = false // RUN A: false (solo periodico); RUN B: true (periodico + eventi)
-)
 
 type svcRegisterReq struct {
 	Service    string `json:"service"`
@@ -49,12 +43,6 @@ type svcRegisterReq struct {
 type svcDeregisterReq struct {
 	Service    string `json:"service"`
 	InstanceID string `json:"instance_id"`
-}
-
-// metriche semplici
-type Metrics struct {
-	periodic uint64 // # invii periodici
-	event    uint64 // # invii da evento
 }
 
 type MemberState string
@@ -131,7 +119,6 @@ type Config struct {
 	HeartbeatInterval time.Duration
 	SuspectTimeout    time.Duration
 	DeadTimeout       time.Duration
-	FanoutK           int
 	MaxDigestPeers    int
 
 	// Service discovery
@@ -156,11 +143,6 @@ type Node struct {
 	selfHB     uint64
 	udpPort    int
 	lastSvcVer map[string]uint64 // ultima versione vista per chiave
-	//struct eventi
-	eventCh chan struct{}
-	//metriche
-	metricPeriodic uint64 // # batch gossip inviati per motivo "periodic"
-	metricEvent    uint64 // # batch gossip inviati per motivo "event"
 	//registry
 
 	httpClient *http.Client // client HTTP con timeout
@@ -252,9 +234,7 @@ func NewNode() (*Node, error) {
 
 	// Client HTTP riusabile con timeout
 	n.httpClient = &http.Client{Timeout: 1 * time.Second}
-	if EnableEventGossip {
-		n.eventCh = make(chan struct{}, 64) // buffer per non bloccare
-	}
+
 	n.lastSvcVer = make(map[string]uint64)
 
 	now := time.Now()
@@ -355,9 +335,8 @@ func (n *Node) run() {
 	go n.startDiscoveryAPI(n.cfg.APIPort)
 	n.maybeStartDemoServices()
 
-	// 4) Manutenzione TTL servizi + metriche
+	// 4) Manutenzione TTL servizi
 	go n.serviceRefreshLoop()
-	go n.metricsLoop()
 
 	// 5) Stampa periodica della view
 	ticker := time.NewTicker(3 * time.Second)
@@ -492,36 +471,8 @@ func (n *Node) suspicionLoop() {
 			}
 		}
 
-		// trigger degli eventi (una volta per ogni passaggio a DEAD)
-		for i := 0; i < deadTriggers; i++ {
-			n.onEventTrigger()
-		}
-
 		// scadenze servizi (fa lock al suo interno)
 		n.pruneExpiredServices()
-	}
-}
-
-// Canale per eventi che triggerano un gossip immediato
-func (n *Node) onEventTrigger() {
-	if !EnableEventGossip || n.eventCh == nil {
-		return
-	}
-	select {
-	case n.eventCh <- struct{}{}:
-	default: // coalesce se pieno, niente blocco
-	}
-}
-
-// ---------------- Gossip send/recv ----------------
-func (n *Node) metricsLoop() {
-	t := time.NewTicker(10 * time.Second)
-	defer t.Stop()
-
-	for range t.C {
-		p := atomic.LoadUint64(&n.metricPeriodic)
-		e := atomic.LoadUint64(&n.metricEvent)
-		log.Printf("[METRICS] gossip_batches periodic=%d event=%d", p, e)
 	}
 }
 
@@ -533,19 +484,6 @@ func (n *Node) gossipLoop() {
 		select {
 		case <-t.C:
 			n.sendGossip("periodic")
-
-		case <-n.eventCh:
-			// Coalesce di eventuali ulteriori trigger arrivati quasi insieme
-			drained := 0
-			for drained < 32 { // limite di sicurezza per non loopare infinito
-				select {
-				case <-n.eventCh:
-					drained++
-				default:
-					drained = 32 // esci
-				}
-			}
-			n.sendGossip("event")
 		}
 	}
 }
@@ -555,13 +493,6 @@ func (n *Node) sendGossip(origin string) {
 	// normalizza il tag di origine per i log
 	if origin == "" {
 		origin = "unknown"
-	}
-
-	switch origin {
-	case "periodic":
-		atomic.AddUint64(&n.metricPeriodic, 1)
-	case "event":
-		atomic.AddUint64(&n.metricEvent, 1)
 	}
 
 	// 1) Calcolo fanout dinamico
@@ -890,8 +821,6 @@ func (n *Node) mergeMembership(gm *GossipMessage) int {
 			self.LastSeen = now
 			updated++
 			log.Printf("[SELF-BUMP] inc %d -> %d (refuting old view)", oldInc, self.Incarnation)
-			// spingi subito la notizia (opzionale ma consigliato)
-			n.onEventTrigger()
 		}
 	}
 
@@ -1172,10 +1101,6 @@ func (n *Node) startDiscoveryAPI(port int) {
 
 		n.registerLocalService(req.Service, req.InstanceID, req.Addr, req.TTL)
 
-		if EnableEventGossip {
-			n.onEventTrigger() // diffondi subito la novità
-		}
-
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	})
@@ -1200,10 +1125,6 @@ func (n *Node) startDiscoveryAPI(port int) {
 		}
 
 		n.deregisterLocalService(req.Service, req.InstanceID)
-
-		if EnableEventGossip {
-			n.onEventTrigger()
-		}
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
@@ -1567,13 +1488,6 @@ func (n *Node) printView() {
 		age := time.Since(sr.S.LastUpdated).Truncate(time.Millisecond)
 		log.Printf("  [SVC] %-18s id=%-14s up=%-5v ver=%-3d ttl=%-2ds age=%-8s addr=%s node=%s",
 			sr.S.Service, sr.S.InstanceID, sr.S.Up, sr.S.Version, sr.S.TTLSeconds, age, sr.S.Addr, sr.S.NodeID)
-	}
-}
-
-// opzionale: scateno subito un giro di gossip per diffondere il cambio servizio
-func (n *Node) triggerGossipForServiceChange() {
-	if EnableEventGossip {
-		n.onEventTrigger()
 	}
 }
 
