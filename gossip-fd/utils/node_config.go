@@ -2,13 +2,12 @@ package utils
 
 import (
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 )
 
-type Config struct {
+type NodeConfig struct {
 	SelfID            string
 	SelfAddr          string
 	UDPPort           int // ← porta UDP derivata da SELF_ADDR
@@ -38,57 +37,25 @@ type Config struct {
 	VotePriorityRounds int
 }
 
-func parseIntEnv(key string, def int) int {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return def
-	}
-	return n
-}
-
-func parseDurationEnv(key string, def time.Duration) time.Duration {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return def
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		return def
-	}
-	return d
-}
-
-func mustEnv(key, def string) string {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return def
-	}
-	return v
-}
-
-func GetConfig() (Config, error) {
+func GetNodeConfig() (NodeConfig, error) {
 	id := mustEnv("SELF_ID", "")
 	addr := mustEnv("SELF_ADDR", "") // "node1:9000"
 	if id == "" || addr == "" {
-		return Config{}, fmt.Errorf("SELF_ID e SELF_ADDR sono obbligatori")
+		return NodeConfig{}, fmt.Errorf("SELF_ID e SELF_ADDR sono obbligatori")
 	}
 	_, portStr, ok := strings.Cut(addr, ":")
 	if !ok || portStr == "" {
-		return Config{}, fmt.Errorf("SELF_ADDR senza porta: %s", addr)
+		return NodeConfig{}, fmt.Errorf("SELF_ADDR senza porta: %s", addr)
 	}
 	udpPort, err := strconv.Atoi(portStr)
 	if err != nil {
-		return Config{}, fmt.Errorf("porta invalida in SELF_ADDR: %v", err)
+		return NodeConfig{}, fmt.Errorf("porta invalida in SELF_ADDR: %v", err)
 	}
 
 	// default: API_PORT = porta UDP
 	apiPort := parseIntEnv("API_PORT", udpPort)
 
-	cfg := Config{
+	cfg := NodeConfig{
 		SelfID:            id,
 		SelfAddr:          addr,
 		UDPPort:           udpPort,

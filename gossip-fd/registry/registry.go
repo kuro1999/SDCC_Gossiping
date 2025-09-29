@@ -7,9 +7,6 @@ import (
 	"math"
 	"math/rand/v2"
 	"net/http"
-	"os"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
@@ -17,6 +14,7 @@ import (
 type Registry struct {
 	mu    sync.Mutex
 	nodes map[string]*regEntry
+	cfg   RegistryConfig
 }
 
 type regEntry struct {
@@ -27,18 +25,6 @@ type regEntry struct {
 
 type regJoinResp struct {
 	Peers []string `json:"peers"`
-}
-
-type config struct {
-	port int
-}
-
-// majorityLocked calcola la maggioranza sul numero corrente di nodi.
-// Deve essere chiamata a lock già acquisito.
-func (r *Registry) majorityLocked() (maj, total int) {
-	total = len(r.nodes)
-	maj = total/2 + 1
-	return
 }
 
 func (r *Registry) startRegistry(port int) {
@@ -104,25 +90,13 @@ func (r *Registry) startRegistry(port int) {
 	}
 }
 
-func parseIntEnv(key string, def int) int {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return def
-	}
-	return n
-}
-
 func main() {
-	cfg := config{
-		port: parseIntEnv("PORT", 8089),
+	cfg := GetRegistryConfig()
+	reg := &Registry{
+		nodes: make(map[string]*regEntry),
+		cfg:   cfg,
 	}
-
-	reg := &Registry{}
-	reg.startRegistry(cfg.port)
+	reg.startRegistry(reg.cfg.port)
 
 	select {}
 }

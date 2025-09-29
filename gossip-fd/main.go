@@ -164,7 +164,7 @@ type GossipMessage struct {
 // ---------------- Config ----------------
 
 type Node struct {
-	cfg     utils.Config
+	cfg     utils.NodeConfig
 	conn    *net.UDPConn
 	mu      sync.Mutex
 	members map[string]*Member
@@ -505,7 +505,7 @@ func (n *Node) gcDeathMeta() {
 // ---------------- Node init ----------------
 
 func NewNode() (*Node, error) {
-	cfg, err := utils.GetConfig()
+	cfg, err := utils.GetNodeConfig()
 	if err != nil {
 		return nil, err
 	}
