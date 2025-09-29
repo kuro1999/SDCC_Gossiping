@@ -2,9 +2,10 @@
 package main
 
 import (
+	"SDCC_Gossiping/utils"
 	"bytes"
 	"encoding/json"
-	"errors"
+	_ "errors"
 	"fmt"
 	"log"
 	"math"
@@ -162,36 +163,8 @@ type GossipMessage struct {
 
 // ---------------- Config ----------------
 
-type Config struct {
-	SelfID            string
-	SelfAddr          string
-	GossipInterval    time.Duration
-	HeartbeatInterval time.Duration
-	SuspectTimeout    time.Duration
-	DeadTimeout       time.Duration
-	MaxDigestPeers    int
-
-	// Service discovery
-	APIPort          int    // HTTP API per discovery
-	ServicesCSV      string // es: "calc"
-	CalcPort         int    // porta del servizio demo calc
-	ServiceTTL       int    // TTL in secondi (annunci)
-	MaxServiceDigest int    // quanti annunci piggyback per messaggio
-
-	//registry
-	RegistryURL string
-	// ====== Death certificates a quorum ======
-	QuorumK            int           // numero di witness richiesti (K)
-	VoteWindow         time.Duration // finestra di raccolta voti (Δ)
-	ObitTTL            time.Duration // durata di validità del certificato
-	MaxVoteDigest      int           // max voti piggyback per messaggio
-	MaxObitDigest      int           // max obituaries piggyback per messaggio
-	ObitPriorityRounds int           // round consecutivi in cui gli obits sono prioritari
-	VotePriorityRounds int           // round consecutivi in cui i voti sono prioritari
-}
-
 type Node struct {
-	cfg     Config
+	cfg     utils.Config
 	conn    *net.UDPConn
 	mu      sync.Mutex
 	members map[string]*Member
@@ -209,40 +182,6 @@ type Node struct {
 	votes           map[string]*voteBucket // key = targetID
 	obits           map[string]*obitEntry  // key = targetID
 	recentlyEvicted map[string]time.Time   // anti-rumore log/cleanup
-}
-
-// ---------------- Utilità env ----------------
-
-func mustEnv(key, def string) string {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return def
-	}
-	return v
-}
-
-func parseDurationEnv(key string, def time.Duration) time.Duration {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return def
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		return def
-	}
-	return d
-}
-
-func parseIntEnv(key string, def int) int {
-	v := strings.TrimSpace(os.Getenv(key))
-	if v == "" {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return def
-	}
-	return n
 }
 
 // =============== Helper per death certificates ===============
@@ -566,109 +505,47 @@ func (n *Node) gcDeathMeta() {
 // ---------------- Node init ----------------
 
 func NewNode() (*Node, error) {
-	id := mustEnv("SELF_ID", "")
-	addr := mustEnv("SELF_ADDR", "") // "node1:9000"
-	if id == "" || addr == "" {
-		return nil, errors.New("SELF_ID e SELF_ADDR sono obbligatori")
-	}
-	_, portStr, _ := strings.Cut(addr, ":")
-	if portStr == "" {
-		return nil, fmt.Errorf("SELF_ADDR senza porta: %s", addr)
-	}
-	port, err := strconv.Atoi(portStr)
+	cfg, err := utils.GetConfig()
 	if err != nil {
-		return nil, fmt.Errorf("porta invalida in SELF_ADDR: %v", err)
+		return nil, err
 	}
 
-	// Nota: default di API_PORT = porta UDP, non 8080
-	apiPort := parseIntEnv("API_PORT", port)
-
-	cfg := Config{
-		SelfID:            id,
-		SelfAddr:          addr,
-		GossipInterval:    parseDurationEnv("GOSSIP_INTERVAL", 700*time.Millisecond),
-		HeartbeatInterval: parseDurationEnv("HEARTBEAT_INTERVAL", 500*time.Millisecond),
-		SuspectTimeout:    parseDurationEnv("SUSPECT_TIMEOUT", 2500*time.Millisecond),
-		DeadTimeout:       parseDurationEnv("DEAD_TIMEOUT", 6000*time.Millisecond),
-		MaxDigestPeers:    parseIntEnv("MAX_DIGEST", 64),
-		APIPort:           apiPort, // <-- default allineato alla porta UDP
-		ServicesCSV:       mustEnv("SERVICES", ""),
-		CalcPort:          parseIntEnv("CALC_PORT", 18080),
-		ServiceTTL:        parseIntEnv("SERVICE_TTL", 15),
-		MaxServiceDigest:  parseIntEnv("MAX_SERVICE_DIGEST", 64),
-		RegistryURL:       mustEnv("REGISTRY_URL", "registry:8089"), // <-- da env
-		// ====== Death certificates defaults ======
-		QuorumK:            parseIntEnv("QUORUM_K", 2),
-		VoteWindow:         parseDurationEnv("VOTE_WINDOW", 6*time.Second), // ~ DeadTimeout
-		ObitTTL:            parseDurationEnv("OBIT_TTL", 18*time.Second),   // 3× DeadTimeout
-		MaxVoteDigest:      parseIntEnv("MAX_VOTE_DIGEST", 16),
-		MaxObitDigest:      parseIntEnv("MAX_OBIT_DIGEST", 8),
-		ObitPriorityRounds: parseIntEnv("OBIT_PRIORITY_ROUNDS", 3),
-		VotePriorityRounds: parseIntEnv("VOTE_PRIORITY_ROUNDS", 2),
-	}
-
-	udpAddr := net.UDPAddr{IP: net.IPv4zero, Port: port}
+	udpAddr := net.UDPAddr{IP: net.IPv4zero, Port: cfg.UDPPort}
 	conn, err := net.ListenUDP("udp", &udpAddr)
 	if err != nil {
 		return nil, fmt.Errorf("errore ListenUDP: %w", err)
 	}
 
 	n := &Node{
-		cfg:      cfg,
-		conn:     conn,
-		members:  make(map[string]*Member),
-		services: make(map[string]*ServiceInstance),
-		udpPort:  port,
+		cfg:             cfg,
+		conn:            conn,
+		members:         make(map[string]*Member),
+		services:        make(map[string]*ServiceInstance),
+		udpPort:         cfg.UDPPort,
+		votes:           make(map[string]*voteBucket),
+		obits:           make(map[string]*obitEntry),
+		recentlyEvicted: make(map[string]time.Time),
+		httpClient:      &http.Client{Timeout: 1 * time.Second},
+		lastSvcVer:      make(map[string]uint64),
 	}
-	n.votes = make(map[string]*voteBucket)
-	n.obits = make(map[string]*obitEntry)
-	n.recentlyEvicted = make(map[string]time.Time)
-
-	// Client HTTP riusabile con timeout
-	n.httpClient = &http.Client{Timeout: 1 * time.Second}
-
-	n.lastSvcVer = make(map[string]uint64)
 
 	now := time.Now()
-	n.members[id] = &Member{
-		ID:          id,
-		Addr:        addr,
+	n.members[cfg.SelfID] = &Member{
+		ID:          n.cfg.SelfID,
+		Addr:        n.cfg.SelfAddr,
 		Heartbeat:   0,
 		LastSeen:    now,
 		Incarnation: 1,
 		State:       StateAlive,
 	}
 
-	// seed peers (opzionali)
-	seeds := strings.Split(strings.TrimSpace(os.Getenv("SEEDS")), ",")
-	for _, s := range seeds {
-		s = strings.TrimSpace(s)
-		if s == "" || s == addr {
-			continue
-		}
-		host, portStr, _ := strings.Cut(s, ":")
-		if host == "" || portStr == "" {
-			continue
-		}
-		peerID := host
-		n.members[peerID] = &Member{
-			ID:        peerID,
-			Addr:      s,
-			Heartbeat: 0,
-			LastSeen:  time.Time{},
-			State:     StateSuspect,
-		}
-	}
-
-	// Avviso se API e UDP non coincidono (solo warning informativo)
 	if n.cfg.APIPort != n.udpPort {
 		log.Printf("[WARN] API_PORT (%d) diverso dalla porta UDP (%d). "+
-			"Il registry restituisce indirizzi HTTP (API). Se non coincideranno con l'UDP, "+
+			"Il registry restituisce indirizzi HTTP (API). Se non coincidono con l'UDP, "+
 			"il gossip verso i peer del registry potrebbe non raggiungerli. "+
-			"Valuta di usare la stessa porta o estendere il registry con http_addr/udp_addr.",
+			"Valuta la stessa porta o http_addr/udp_addr nel registry.",
 			n.cfg.APIPort, n.udpPort)
 	}
-
 	return n, nil
 }
 

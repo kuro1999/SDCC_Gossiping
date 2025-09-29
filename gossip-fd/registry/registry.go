@@ -70,16 +70,11 @@ func (r *Registry) startRegistry(port int) {
 
 		// Calcolo dinamico del numero di peer da restituire (log2(N) + 1)
 		N := len(peers)
-		k := int(math.Log2(float64(N))) + 1
-		if k > N {
-			k = N // Se k è maggiore del numero di peer, restituisci tutti
-		}
-		if k < 1 {
-			k = 1 // Assicurati che k sia almeno 1
-		}
-
-		// Se ci sono peer disponibili, seleziona k peer casuali
-		if N > 0 {
+		var k int
+		if N == 0 {
+			log.Printf("no peers found, giving an empty list to node: %s", in.ID)
+		} else {
+			k = int(math.Log2(float64(N))) + 1
 			rand.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
 			if len(peers) >= k { // <-- guardia extra
 				peers = peers[:k]
@@ -88,8 +83,6 @@ func (r *Registry) startRegistry(port int) {
 			for _, p := range peers {
 				log.Printf("\t%s", p)
 			}
-		} else {
-			log.Printf("no peers found, giving an empty list to node: %s", in.ID)
 		}
 
 		// Aggiungi il nuovo nodo al registro dopo avergli dato la lista dei peer
