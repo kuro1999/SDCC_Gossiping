@@ -7,6 +7,9 @@ import (
 	"math"
 	"math/rand/v2"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -14,7 +17,7 @@ import (
 type Registry struct {
 	mu    sync.Mutex
 	nodes map[string]*regEntry
-	cfg   RegistryConfig
+	port  int
 }
 
 type regEntry struct {
@@ -90,13 +93,23 @@ func (r *Registry) startRegistry(port int) {
 	}
 }
 
+func parseIntEnv(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
 func main() {
-	cfg := GetRegistryConfig()
 	reg := &Registry{
 		nodes: make(map[string]*regEntry),
-		cfg:   cfg,
+		port:  parseIntEnv("PORT", 8089),
 	}
-	reg.startRegistry(reg.cfg.port)
+	reg.startRegistry(reg.port)
 
 	select {}
 }
