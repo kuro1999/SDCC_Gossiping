@@ -1,149 +1,220 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Deployment script for EC2 instance to setup the project and run Docker Compose
+# ------------------------------------------------------------------------------
+# Deploy Progetto SDCC (o altro repo) su EC2 clonando direttamente da GitHub.
 #
-# Usage: ./setup_ec2.sh <public-ip>
-#   <public-ip>  Public IPv4 address of the EC2 instance
+# USO:
+#   ./deploy_sdcc_ec2.sh <user> <public-ip> <repo-url> [branch]
 #
-# This script assumes you have exactly one .pem file in a sibling directory called
-# `keys/` which contains your private EC2 key. It will package the current project,
-# copy it to the EC2 instance via scp, install Docker, Docker Compose, and Git on the remote machine if necessary,
-# clone the GitHub repository, and run `docker compose up -d --build` to start the services.
+# Esempio:
+#   ./setup_ec2.sh ec2-user ec2-52-91-53-189.compute-1.amazonaws.com
+#
+# Assunzioni:
+# - Hai una singola chiave .pem in ./key/ (come nel tuo script precedente).
+# - Sul repo è presente un docker-compose (compose.yaml o docker-compose.yml).
+# - Se il repo è privato via HTTPS, usa un PAT in REPO_URL (oppure usa URL SSH + chiave).
+# ------------------------------------------------------------------------------
 
-set -e
+# ---- Logging semplice
+log()  { echo "INFO: $*"; }
+fail() { echo "ERROR: $*" >&2; exit 1; }
 
-# Define script and key directory
-SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-KEY_DIR="${SCRIPT_DIR}/keys"
-REPO_URL="https://github.com/kuro1999/SDCC_Gossiping.git"
-PROJECT_NAME="SDCC_Gossiping"
-PROJECT_DIR="/home/ec2-user/${PROJECT_NAME}"
-
-# Logging helpers
-log_info() {
-    echo "INFO: $1"
-}
-
-log_error() {
-    echo "ERROR: $1" >&2
-    exit 1
-}
-
-# Validate arguments
-if [ "$#" -ne 1 ]; then
-    echo "Usage: $0 <public-ip>"
-    exit 1
+# ---- Argomenti
+if [ "$#" -lt 3 ] || [ "$#" -gt 4 ]; then
+  echo "Uso: $0 <user> <public-ip> <repo-url> [branch]"
+  exit 1
 fi
-
-EC2_HOST=$1
 EC2_USER="ec2-user"
+EC2_HOST="ec2-34-201-103-97.compute-1.amazonaws.com"
+REPO_URL="https://github.com/kuro1999/SDCC_Gossiping.git"
+REPO_BRANCH="main"
+
 EC2_TARGET="${EC2_USER}@${EC2_HOST}"
 
-# Locate the .pem key
-log_info "Searching for .pem key in ${KEY_DIR}..."
-PEM_FILES=()
-while IFS= read -r -d $'\0'; do
-    PEM_FILES+=("$REPLY")
-done < <(find "$KEY_DIR" -maxdepth 1 -type f -name "*.pem" -print0)
-if [ "${#PEM_FILES[@]}" -eq 0 ]; then
-    log_error "No .pem key found in ${KEY_DIR}."
-fi
-if [ "${#PEM_FILES[@]}" -gt 1 ]; then
-    echo "Found keys:"
-    printf " - %s\n" "${PEM_FILES[@]##*/}"
-    log_error "Multiple .pem keys found; ensure only one is present."
-fi
-SSH_KEY_PATH="${PEM_FILES[0]}"
-log_info "Using key ${SSH_KEY_PATH}"
+# ---- Individua la chiave .pem in ./key come nel tuo script
+SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+KEY_DIR="${SCRIPT_DIR}/key"
 
-# Create a secure temporary copy of the key
-TEMP_KEY=$(mktemp)
+log "Cerco la chiave .pem in ${KEY_DIR}..."
+mapfile -d '' PEM_FILES < <(find "$KEY_DIR" -maxdepth 1 -type f -name "*.pem" -print0 || true)
+[ "${#PEM_FILES[@]}" -eq 0 ] && fail "Nessuna chiave .pem trovata in ${KEY_DIR}"
+[ "${#PEM_FILES[@]}" -gt 1 ] && { printf "Trovate più chiavi:\n - %s\n" "${PEM_FILES[@]##*/}"; fail "Rimuovi le chiavi extra e lascia una sola .pem"; }
+
+SSH_KEY_PATH="${PEM_FILES[0]}"
+log "Uso la chiave ${SSH_KEY_PATH}"
+
+# Copia temporanea con permessi stretti
+TEMP_KEY="$(mktemp)"
 trap 'rm -f "$TEMP_KEY"' EXIT
 cat "$SSH_KEY_PATH" > "$TEMP_KEY"
 chmod 600 "$TEMP_KEY"
 
-SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o ServerAliveInterval=30)
 
-# Test SSH connectivity
-log_info "Testing SSH connectivity to ${EC2_TARGET}..."
+# ---- Test SSH
+log "Verifico connettività SSH verso ${EC2_TARGET}..."
 if ! ssh "${SSH_OPTS[@]}" -i "$TEMP_KEY" -o ConnectTimeout=10 "$EC2_TARGET" "exit" 2>/dev/null; then
-    log_error "Unable to connect to ${EC2_TARGET}. Check instance state, IP and security group."
+  fail "Connessione fallita a ${EC2_TARGET}. Controlla IP, stato istanza e security group."
 fi
-log_info "SSH connection OK."
+log "SSH ok."
 
-# Install prerequisites on remote: Docker, Compose plugin, and Git
-log_info "Ensuring Docker, Docker Compose and Git are installed on remote..."
-ssh "${SSH_OPTS[@]}" -i "$TEMP_KEY" "$EC2_TARGET" << 'REMOTESETUP'
-set -e
-# Determine package manager
-if command -v dnf &>/dev/null; then
-    PKG=dnf
-elif command -v yum &>/dev/null; then
-    PKG=yum
-elif command -v apt-get &>/dev/null; then
-    PKG=apt-get
-else
-    echo "Unsupported package manager." >&2
-    exit 1
-fi
+# ---- Variabili di deploy (puoi cambiare la directory di destinazione)
+# Nome cartella dal nome repo (senza .git)
+REPO_NAME="$(basename -s .git "$REPO_URL")"
+PROJECT_DIR="/opt/${REPO_NAME}"
 
-install_pkgs() {
-    if [ "$PKG" = "apt-get" ]; then
-        sudo apt-get update -y
-        sudo apt-get install -y "$@"
-    else
-        sudo "$PKG" install -y "$@"
-    fi
+# ---- Script remoto: installa prerequisiti, clona/aggiorna repo, up compose
+log "Eseguo setup remoto: pacchetti, repo e compose..."
+
+ssh "${SSH_OPTS[@]}" -i "$TEMP_KEY" "$EC2_TARGET" \
+  "export REPO_URL='$REPO_URL' REPO_BRANCH='$REPO_BRANCH' PROJECT_DIR='$PROJECT_DIR' REPO_NAME='$REPO_NAME'; bash -s" <<'REMOTE'
+set -euo pipefail
+
+# ----------------- helper -----------------
+need_sudo() { [ "$(id -u)" -ne 0 ] && echo "sudo" || true; }
+SUDO="$(need_sudo)"
+
+pkg_detect() {
+  if command -v apt-get >/dev/null 2>&1; then echo "apt";
+  elif command -v dnf >/dev/null 2>&1; then echo "dnf";
+  elif command -v yum >/dev/null 2>&1; then echo "yum";
+  else echo "unknown"; fi
 }
 
-# Docker
-if ! command -v docker &>/dev/null; then
-    echo "Installing Docker..."
-    if [ "$PKG" = "apt-get" ]; then
-        install_pkgs docker.io
-    else
-        install_pkgs docker
-    fi
-    sudo systemctl start docker
-    sudo systemctl enable docker
-    sudo usermod -aG docker "$USER"
+install_base() {
+  case "$(pkg_detect)" in
+    apt)
+      $SUDO apt-get update -y
+      $SUDO apt-get install -y git ca-certificates curl
+      ;;
+    dnf|yum)
+      # Installa Git e ca-certificates. NON forzare 'curl' su AL2023.
+      $SUDO "${PKG:-$(pkg_detect)}" -y install git ca-certificates
+
+      # Installa 'curl' solo se né curl né curl-minimal sono presenti
+      if ! command -v curl >/dev/null 2>&1 && ! rpm -q curl-minimal >/dev/null 2>&1; then
+        $SUDO "${PKG:-$(pkg_detect)}" -y install curl || true
+      fi
+      ;;
+    *)
+      echo "Package manager non riconosciuto: installa manualmente git/curl." >&2
+      ;;
+  esac
+}
+
+
+install_docker() {
+  if command -v docker >/dev/null 2>&1; then
+    echo "[INFO] Docker già presente"
+  else
+    . /etc/os-release || true
+    case "$ID" in
+      amzn)
+        if command -v amazon-linux-extras >/dev/null 2>&1; then
+          $SUDO amazon-linux-extras install -y docker
+        else
+          $SUDO dnf install -y docker || $SUDO yum install -y docker
+        fi
+        ;;
+      ubuntu|debian)
+        $SUDO apt-get update -y
+        $SUDO apt-get install -y docker.io docker-compose-plugin
+        ;;
+      rhel|rocky|almalinux|centos|fedora)
+        $SUDO dnf install -y docker docker-compose-plugin || $SUDO yum install -y docker
+        ;;
+      *)
+        # fallback ufficiale
+        curl -fsSL https://get.docker.com | $SUDO sh
+        ;;
+    esac
+  fi
+  $SUDO systemctl enable docker
+  $SUDO systemctl start docker || true
+}
+
+ensure_compose_plugin() {
+  if docker compose version >/dev/null 2>&1; then
+    echo "[INFO] Docker Compose v2 già installato"
+    return 0
+  fi
+  # Installazione manuale del plugin v2 (fallback)
+  if ! command -v curl >/dev/null 2>&1; then
+    case "$(pkg_detect)" in
+      apt) $SUDO apt-get install -y curl ;;
+      dnf|yum) $SUDO "${PKG:-$(pkg_detect)}" -y install curl ;;
+    esac
+  fi
+  dest="/usr/local/lib/docker/cli-plugins"
+  arch="$(uname -m)"
+  ver="v2.27.0"
+  $SUDO mkdir -p "$dest"
+  $SUDO curl -fsSL "https://github.com/docker/compose/releases/download/${ver}/docker-compose-linux-${arch}" -o "${dest}/docker-compose"
+  $SUDO chmod +x "${dest}/docker-compose"
+  echo "[INFO] Installato Docker Compose plugin ${ver}"
+}
+
+# ----------------- esecuzione -----------------
+install_base
+install_docker
+ensure_compose_plugin
+
+# Se l'utente corrente non è nel gruppo docker, consumeremo 'sudo docker' più giù
+# (aggiungere al gruppo richiede logout/login per avere effetto)
+if ! id -nG | grep -qw docker; then
+  $SUDO usermod -aG docker "$(id -un)" || true
 fi
 
-# Docker Compose plugin
-if ! docker compose version &>/dev/null; then
-    echo "Installing Docker Compose v2 plugin..."
-    if ! command -v curl &>/dev/null; then
-        install_pkgs curl
-    fi
-    dest="/usr/local/lib/docker/cli-plugins"
-    sudo mkdir -p "$dest"
-    ver=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep -oP '"tag_name": "\K(v[0-9]+\.[0-9]+\.[0-9]+)')
-    [ -z "$ver" ] && ver="v2.27.0"
-    sudo curl -SL "https://github.com/docker/compose/releases/download/${ver}/docker-compose-linux-$(uname -m)" -o "${dest}/docker-compose"
-    sudo chmod +x "${dest}/docker-compose"
+# Clona o aggiorna il repo
+if [ -d "$PROJECT_DIR/.git" ]; then
+  echo "[INFO] Repo esistente in $PROJECT_DIR → fetch&reset"
+  cd "$PROJECT_DIR"
+  git fetch --all --prune
+  git checkout "$REPO_BRANCH"
+  git reset --hard "origin/$REPO_BRANCH"
+else
+  echo "[INFO] Clono $REPO_URL in $PROJECT_DIR"
+  $SUDO mkdir -p "$PROJECT_DIR"
+  $SUDO chown -R "$(id -u)":"$(id -g)" "$PROJECT_DIR"
+  git clone --branch "$REPO_BRANCH" "$REPO_URL" "$PROJECT_DIR"
+  cd "$PROJECT_DIR"
 fi
 
-# Git
-if ! command -v git &>/dev/null; then
-    echo "Installing Git..."
-    install_pkgs git
+# Se esiste .env.example e manca .env, crealo
+if [ -f ".env.example" ] && [ ! -f ".env" ]; then
+  cp .env.example .env
+  echo "[INFO] Creato .env da .env.example (modifica i valori se necessario)"
 fi
-REMOTESETUP
 
-log_info "Remote prerequisites installed."
+# Tenta compose con plugin v2; fallback a docker-compose v1 se presente
+set +e
+docker compose version >/dev/null 2>&1
+HAS_V2=$?
+set -e
 
-# Clone the GitHub repository
-log_info "Cloning GitHub repository..."
-ssh "${SSH_OPTS[@]}" -i "$TEMP_KEY" "$EC2_TARGET" "git clone ${REPO_URL} ${PROJECT_DIR}"
+if [ "$HAS_V2" -eq 0 ]; then
+  echo "[INFO] Avvio servizi con 'docker compose up -d --build'"
+  $SUDO docker compose up -d --build
+else
+  if command -v docker-compose >/dev/null 2>&1; then
+    echo "[INFO] Avvio servizi con 'docker-compose up -d --build'"
+    $SUDO docker-compose up -d --build
+  else
+    echo "Né 'docker compose' v2 né 'docker-compose' v1 disponibili." >&2
+    exit 1
+  fi
+fi
 
-# Write .env file for frontend config
-log_info "Writing .env file on remote host..."
-ssh "${SSH_OPTS[@]}" -i "$TEMP_KEY" "$EC2_TARGET" "echo \"REACT_APP_API_BASE_URL=http://${EC2_HOST}:8000\" > ${PROJECT_DIR}/.env"
+echo "[OK] Deploy completato in $PROJECT_DIR"
+REMOTE
 
-# Start Docker Compose
-log_info "Starting services via docker compose..."
-ssh "${SSH_OPTS[@]}" -i "$TEMP_KEY" "$EC2_TARGET" "cd ${PROJECT_DIR} && (docker compose version &>/dev/null && sudo docker compose up -d --build || sudo docker-compose up -d --build)"
+log "Deploy completato."
 
-log_info "Deployment finished!"
-echo "Application (frontend) URL: http://${EC2_HOST}:8090"
-echo "API gateway URL:       http://${EC2_HOST}:8000"
+# ---- Promemoria porte (non possiamo aprirle qui: va fatto nel Security Group)
+echo
+echo "Promemoria porte EC2 da aprire nel Security Group (in base al tuo progetto):"
+echo " - Registry/Nodes UDP/TCP (esempi): 9000-9015"
+echo " - Eventuali frontend/API (esempi): 8000, 8090"
+echo
+echo "Se usi compose con mapping porte, accedi con http://${EC2_HOST}:<porta-mappata>"

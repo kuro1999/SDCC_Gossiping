@@ -8,175 +8,178 @@ services:
       dockerfile: Dockerfile
     container_name: registry
     environment:
-      - registry_port=8089
-
+      - registry_port=${REGISTRY_PORT}
     ports:
-      - "8089:8089"
-
+      - "${REGISTRY_PORT}:${REGISTRY_PORT}"
 
   # --- Node 1 ---
   node1:
-    build: .          # cartella con il codice del nodo
+    build: .
     container_name: node1
     depends_on:
       - registry
     environment:
-      - SELF_ID=node1
-      - SELF_ADDR=node1:9000
-      - REGISTRY_URL=registry:8089
-      - SEEDS=                   # opzionale fallback, tienilo vuoto o rimuovi
-      - GOSSIP_INTERVAL=1400ms
-      - HEARTBEAT_INTERVAL=1000ms
-      - SUSPECT_TIMEOUT=5000ms
-      - DEAD_TIMEOUT=12000ms
-      # service discovery
-      - SERVICES=
-      - CALC_PORT=18080
-      - SERVICE_TTL=15
-      - MAX_SERVICE_DIGEST=64
+      - SELF_ID=${NODE1_ID}
+      - SELF_ADDR=${NODE1_HOST}:${NODE1_PORT}
+      - REGISTRY_URL=${REGISTRY_HOST}:${REGISTRY_PORT}
+      - SEEDS=${SEEDS}
+      - GOSSIP_INTERVAL=${GOSSIP_INTERVAL}
+      - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL}
+      - SUSPECT_TIMEOUT=${SUSPECT_TIMEOUT}
+      - DEAD_TIMEOUT=${DEAD_TIMEOUT}
+      - SERVICES=${SERVICES_DEFAULT}
+      - CALC_PORT=${NODE1_CALC_PORT}
+      - SERVICE_TTL=${SERVICE_TTL}
+      - MAX_SERVICE_DIGEST=${MAX_SERVICE_DIGEST}
     ports:
-      - "9000:9000/udp"
-      - "9000:9000/tcp"
-      - "18080:18080"
+      - "${NODE1_PORT}:${NODE1_PORT}/udp"
+      - "${NODE1_PORT}:${NODE1_PORT}/tcp"
+      - "${NODE1_CALC_PORT}:${NODE1_CALC_PORT}"
     restart: unless-stopped
 
+  # --- Node 2 ---
   node2:
     build: .
     container_name: node2
     depends_on: [registry]
     environment:
-      - SELF_ID=node2
-      - SELF_ADDR=node2:9001
-      - REGISTRY_URL=registry:8089
-      - SEEDS=
-      - GOSSIP_INTERVAL=1400ms
-      - HEARTBEAT_INTERVAL=1000ms
-      - SUSPECT_TIMEOUT=5000ms
-      - DEAD_TIMEOUT=12000ms
-      - SERVICES=
-      - CALC_PORT=18081
-      - SERVICE_TTL=15
-      - MAX_SERVICE_DIGEST=64
+      - SELF_ID=${NODE2_ID}
+      - SELF_ADDR=${NODE2_HOST}:${NODE2_PORT}
+      - REGISTRY_URL=${REGISTRY_HOST}:${REGISTRY_PORT}
+      - SEEDS=${SEEDS}
+      - GOSSIP_INTERVAL=${GOSSIP_INTERVAL}
+      - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL}
+      - SUSPECT_TIMEOUT=${SUSPECT_TIMEOUT}
+      - DEAD_TIMEOUT=${DEAD_TIMEOUT}
+      - SERVICES=${SERVICES_DEFAULT}
+      - CALC_PORT=${NODE2_CALC_PORT}
+      - SERVICE_TTL=${SERVICE_TTL}
+      - MAX_SERVICE_DIGEST=${MAX_SERVICE_DIGEST}
     ports:
-      - "9001:9001/udp"
-      - "9001:9001/tcp"
-      - "18081:18081"
+      - "${NODE2_PORT}:${NODE2_PORT}/udp"
+      - "${NODE2_PORT}:${NODE2_PORT}/tcp"
+      - "${NODE2_CALC_PORT}:${NODE2_CALC_PORT}"
     restart: unless-stopped
 
+  # --- Node 3 ---
   node3:
     build: .
     container_name: node3
     depends_on: [registry]
     environment:
-      - SELF_ID=node3
-      - SELF_ADDR=node3:9002
-      - REGISTRY_URL=registry:8089
-      - REGISTRY_JOIN_TIMEOUT=3s
-      - SEEDS=
-      - GOSSIP_INTERVAL=1400ms
-      - HEARTBEAT_INTERVAL=1000ms
-      - SUSPECT_TIMEOUT=5000ms
-      - DEAD_TIMEOUT=12000ms
-      - SERVICES=calc
-      - CALC_PORT=18082
-      - SERVICE_TTL=15
-      - MAX_SERVICE_DIGEST=64
+      - SELF_ID=${NODE3_ID}
+      - SELF_ADDR=${NODE3_HOST}:${NODE3_PORT}
+      - REGISTRY_URL=${REGISTRY_HOST}:${REGISTRY_PORT}
+      - REGISTRY_JOIN_TIMEOUT=${NODE3_REGISTRY_JOIN_TIMEOUT}
+      - SEEDS=${SEEDS}
+      - GOSSIP_INTERVAL=${GOSSIP_INTERVAL}
+      - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL}
+      - SUSPECT_TIMEOUT=${SUSPECT_TIMEOUT}
+      - DEAD_TIMEOUT=${DEAD_TIMEOUT}
+      - SERVICES=${NODE3_SERVICES}
+      - CALC_PORT=${NODE3_CALC_PORT}
+      - SERVICE_TTL=${SERVICE_TTL}
+      - MAX_SERVICE_DIGEST=${MAX_SERVICE_DIGEST}
     ports:
-      - "9002:9002/udp"
-      - "9002:9002/tcp"
-      - "18082:18082"
+      - "${NODE3_PORT}:${NODE3_PORT}/udp"
+      - "${NODE3_PORT}:${NODE3_PORT}/tcp"
+      - "${NODE3_CALC_PORT}:${NODE3_CALC_PORT}"
     restart: unless-stopped
 
+  # --- Node 4 ---
   node4:
     build: .
     container_name: node4
     depends_on: [registry]
     environment:
-      - SELF_ID=node4
-      - SELF_ADDR=node4:9003
-      - REGISTRY_URL=registry:8089
-      - SEEDS=
-      - GOSSIP_INTERVAL=1400ms
-      - HEARTBEAT_INTERVAL=1000ms
-      - SUSPECT_TIMEOUT=5000ms
-      - DEAD_TIMEOUT=12000ms
-      - SERVICES=
-      - CALC_PORT=18083
-      - SERVICE_TTL=15
-      - MAX_SERVICE_DIGEST=64
+      - SELF_ID=${NODE4_ID}
+      - SELF_ADDR=${NODE4_HOST}:${NODE4_PORT}
+      - REGISTRY_URL=${REGISTRY_HOST}:${REGISTRY_PORT}
+      - SEEDS=${SEEDS}
+      - GOSSIP_INTERVAL=${GOSSIP_INTERVAL}
+      - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL}
+      - SUSPECT_TIMEOUT=${SUSPECT_TIMEOUT}
+      - DEAD_TIMEOUT=${DEAD_TIMEOUT}
+      - SERVICES=${SERVICES_DEFAULT}
+      - CALC_PORT=${NODE4_CALC_PORT}
+      - SERVICE_TTL=${SERVICE_TTL}
+      - MAX_SERVICE_DIGEST=${MAX_SERVICE_DIGEST}
     ports:
-      - "9003:9003/udp"
-      - "9003:9003/tcp"
-      - "18083:18083"
+      - "${NODE4_PORT}:${NODE4_PORT}/udp"
+      - "${NODE4_PORT}:${NODE4_PORT}/tcp"
+      - "${NODE4_CALC_PORT}:${NODE4_CALC_PORT}"
     restart: unless-stopped
 
+  # --- Node 5 ---
   node5:
     build: .
     container_name: node5
     depends_on: [registry]
     environment:
-      - SELF_ID=node5
-      - SELF_ADDR=node5:9004
-      - REGISTRY_URL=registry:8089
-      - SEEDS=
-      - GOSSIP_INTERVAL=1400ms
-      - HEARTBEAT_INTERVAL=1000ms
-      - SUSPECT_TIMEOUT=5000ms
-      - DEAD_TIMEOUT=12000ms
-      - SERVICES=
-      - CALC_PORT=18084
-      - SERVICE_TTL=15
-      - MAX_SERVICE_DIGEST=64
+      - SELF_ID=${NODE5_ID}
+      - SELF_ADDR=${NODE5_HOST}:${NODE5_PORT}
+      - REGISTRY_URL=${REGISTRY_HOST}:${REGISTRY_PORT}
+      - SEEDS=${SEEDS}
+      - GOSSIP_INTERVAL=${GOSSIP_INTERVAL}
+      - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL}
+      - SUSPECT_TIMEOUT=${SUSPECT_TIMEOUT}
+      - DEAD_TIMEOUT=${DEAD_TIMEOUT}
+      - SERVICES=${SERVICES_DEFAULT}
+      - CALC_PORT=${NODE5_CALC_PORT}
+      - SERVICE_TTL=${SERVICE_TTL}
+      - MAX_SERVICE_DIGEST=${MAX_SERVICE_DIGEST}
     ports:
-      - "9004:9004/udp"
-      - "9004:9004/tcp"
-      - "18084:18084"
+      - "${NODE5_PORT}:${NODE5_PORT}/udp"
+      - "${NODE5_PORT}:${NODE5_PORT}/tcp"
+      - "${NODE5_CALC_PORT}:${NODE5_CALC_PORT}"
     restart: unless-stopped
 
+  # --- Node 6 ---
   node6:
     build: .
     container_name: node6
     depends_on: [registry]
     environment:
-      - SELF_ID=node6
-      - SELF_ADDR=node6:9005
-      - REGISTRY_URL=registry:8089
-      - SEEDS=
-      - GOSSIP_INTERVAL=1400ms
-      - HEARTBEAT_INTERVAL=1000ms
-      - SUSPECT_TIMEOUT=5000ms
-      - DEAD_TIMEOUT=12000ms
-      - SERVICES=
-      - CALC_PORT=18085
-      - SERVICE_TTL=15
-      - MAX_SERVICE_DIGEST=64
+      - SELF_ID=${NODE6_ID}
+      - SELF_ADDR=${NODE6_HOST}:${NODE6_PORT}
+      - REGISTRY_URL=${REGISTRY_HOST}:${REGISTRY_PORT}
+      - SEEDS=${SEEDS}
+      - GOSSIP_INTERVAL=${GOSSIP_INTERVAL}
+      - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL}
+      - SUSPECT_TIMEOUT=${SUSPECT_TIMEOUT}
+      - DEAD_TIMEOUT=${DEAD_TIMEOUT}
+      - SERVICES=${SERVICES_DEFAULT}
+      - CALC_PORT=${NODE6_CALC_PORT}
+      - SERVICE_TTL=${SERVICE_TTL}
+      - MAX_SERVICE_DIGEST=${MAX_SERVICE_DIGEST}
     ports:
-      - "9005:9005/udp"
-      - "9005:9005/tcp"
-      - "18085:18085"
+      - "${NODE6_PORT}:${NODE6_PORT}/udp"
+      - "${NODE6_PORT}:${NODE6_PORT}/tcp"
+      - "${NODE6_CALC_PORT}:${NODE6_CALC_PORT}"
     restart: unless-stopped
 
+  # --- Node 7 ---
   node7:
     build: .
     container_name: node7
     depends_on: [registry]
     environment:
-      - SELF_ID=node7
-      - SELF_ADDR=node7:9006
-      - REGISTRY_URL=registry:8089
-      - SEEDS=
-      - GOSSIP_INTERVAL=1400ms
-      - HEARTBEAT_INTERVAL=1000ms
-      - SUSPECT_TIMEOUT=5000ms
-      - DEAD_TIMEOUT=12000ms
-      - SERVICES=
-      - CALC_PORT=18086
-      - SERVICE_TTL=15
-      - MAX_SERVICE_DIGEST=64
+      - SELF_ID=${NODE7_ID}
+      - SELF_ADDR=${NODE7_HOST}:${NODE7_PORT}
+      - REGISTRY_URL=${REGISTRY_HOST}:${REGISTRY_PORT}
+      - SEEDS=${SEEDS}
+      - GOSSIP_INTERVAL=${GOSSIP_INTERVAL}
+      - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL}
+      - SUSPECT_TIMEOUT=${SUSPECT_TIMEOUT}
+      - DEAD_TIMEOUT=${DEAD_TIMEOUT}
+      - SERVICES=${SERVICES_DEFAULT}
+      - CALC_PORT=${NODE7_CALC_PORT}
+      - SERVICE_TTL=${SERVICE_TTL}
+      - MAX_SERVICE_DIGEST=${MAX_SERVICE_DIGEST}
     ports:
-      - "9006:9006/udp"
-      - "9006:9006/tcp"
-      - "18086:18086"
+      - "${NODE7_PORT}:${NODE7_PORT}/udp"
+      - "${NODE7_PORT}:${NODE7_PORT}/tcp"
+      - "${NODE7_CALC_PORT}:${NODE7_CALC_PORT}"
     restart: unless-stopped
 
   orchestrator:
@@ -195,4 +198,4 @@ services:
 
 networks:
   default:
-    name: gossip-net
+    name: ${NETWORK_NAME}
