@@ -32,7 +32,6 @@ type regJoinResp struct {
 
 func (r *Registry) startRegistry(port int) {
 	r.nodes = make(map[string]*regEntry)
-
 	mux := http.NewServeMux()
 
 	// POST /api/join
@@ -47,7 +46,7 @@ func (r *Registry) startRegistry(port int) {
 			return
 		}
 
-		// Provide the peer list in the network
+		// fornisce una sotto lista causale di peer nella rete
 		peers := []string{}
 		r.mu.Lock()
 		for id, entry := range r.nodes {
@@ -65,21 +64,21 @@ func (r *Registry) startRegistry(port int) {
 		} else {
 			k = int(math.Log2(float64(N))) + 1
 			rand.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
-			if len(peers) >= k { // <-- guardia extra
+			if len(peers) >= k {
 				peers = peers[:k]
 			}
-			log.Printf("giving k=%d peers to %s:", k, in.ID) // <-- ordine fix
+			log.Printf("giving k=%d peers to %s:", k, in.ID)
 			for _, p := range peers {
 				log.Printf("\t%s", p)
 			}
 		}
 
-		// Aggiungi il nuovo nodo al registro dopo avergli dato la lista dei peer
+		// Aggiunge il nuovo nodo al registro dopo avergli dato la lista dei peer
 		r.mu.Lock()
 		r.nodes[in.ID] = &regEntry{ID: in.ID, Addr: in.Addr, LastSeen: time.Now()}
 		r.mu.Unlock()
 
-		// Rispondi con la lista dei peer
+		// Risponde con la lista dei peer
 		resp := regJoinResp{Peers: peers}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)

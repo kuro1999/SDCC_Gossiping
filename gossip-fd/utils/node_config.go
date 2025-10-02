@@ -10,7 +10,7 @@ import (
 type NodeConfig struct {
 	SelfID            string
 	SelfAddr          string
-	UDPPort           int // ← porta UDP derivata da SELF_ADDR
+	UDPPort           int
 	GossipInterval    time.Duration
 	HeartbeatInterval time.Duration
 	SuspectTimeout    time.Duration
@@ -30,10 +30,10 @@ type NodeConfig struct {
 	// Death certificates a quorum
 	QuorumK            int
 	VoteWindow         time.Duration
-	ObitTTL            time.Duration
+	CertTTL            time.Duration
 	MaxVoteDigest      int
-	MaxObitDigest      int
-	ObitPriorityRounds int
+	MaxCertDigest      int
+	CertPriorityRounds int
 	VotePriorityRounds int
 }
 
@@ -52,7 +52,6 @@ func GetNodeConfig() (NodeConfig, error) {
 		return NodeConfig{}, fmt.Errorf("porta invalida in SELF_ADDR: %v", err)
 	}
 
-	// default: API_PORT = porta UDP
 	apiPort := parseIntEnv("API_PORT", udpPort)
 
 	cfg := NodeConfig{
@@ -75,10 +74,10 @@ func GetNodeConfig() (NodeConfig, error) {
 
 		QuorumK:            parseIntEnv("QUORUM_K", 2),
 		VoteWindow:         parseDurationEnv("VOTE_WINDOW", 6*time.Second),
-		ObitTTL:            parseDurationEnv("OBIT_TTL", 18*time.Second),
+		CertTTL:            parseDurationEnv("OBIT_TTL", 18*time.Second),
 		MaxVoteDigest:      parseIntEnv("MAX_VOTE_DIGEST", 16),
-		MaxObitDigest:      parseIntEnv("MAX_OBIT_DIGEST", 8),
-		ObitPriorityRounds: parseIntEnv("OBIT_PRIORITY_ROUNDS", 3),
+		MaxCertDigest:      parseIntEnv("MAX_OBIT_DIGEST", 8),
+		CertPriorityRounds: parseIntEnv("OBIT_PRIORITY_ROUNDS", 3),
 		VotePriorityRounds: parseIntEnv("VOTE_PRIORITY_ROUNDS", 2),
 	}
 	return cfg, nil

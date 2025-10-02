@@ -19,20 +19,6 @@ import (
 	"time"
 )
 
-/*
-  Failure detection + Service discovery via gossip (versione semplice)
-
-  - Membership gossip: come prima (heartbeat, SUSPECT/DEAD via timeout).
-  - Service discovery:
-      * Ogni nodo mantiene una registry locale delle istanze di servizio.
-      * Annunci (add/update/remove) si propagano come piggyback nei messaggi gossip.
-      * Regole di merge: si accetta la versione più alta (version counter monotono),
-        si onora TTL (se non refreshata oltre TTL*2, l'istanza è scartata).
-      * L'API /discover filtra istanze su nodi non ALIVE.
-
-  - Demo service: "calc" HTTP con /sum e /sub opzionali per la prova end-to-end.
-*/
-
 type MemberState string
 
 const (
@@ -40,8 +26,6 @@ const (
 	StateSuspect MemberState = "SUSPECT"
 	StateDead    MemberState = "DEAD"
 )
-
-// ---------------- Membership ----------------
 
 type Member struct {
 	ID          string      `json:"id"`
@@ -60,14 +44,8 @@ type MemberSummary struct {
 	State       MemberState `json:"state"`
 }
 
-// ---------------- Service Registry ----------------
-
 // chiave stabile per mappa locale
 func svcKey(svc, id string) string { return svc + "##" + id }
-
-// ---------------- Gossip Message ----------------
-
-// ---------------- Config ----------------
 
 type Node struct {
 	cfg     utils.NodeConfig
@@ -80,61 +58,49 @@ type Node struct {
 	selfHB     uint64
 	udpPort    int
 	lastSvcVer map[string]uint64 // ultima versione vista per chiave
-	//registry
 
+	//registry
 	httpClient *http.Client // client HTTP con timeout
 
-	// ====== NEW: meta per eviction by quorum ======
-	votes           map[string]*voteBucket // key = targetID
-	obits           map[string]*obitEntry  // key = targetID
-	recentlyEvicted map[string]time.Time   // anti-rumore log/cleanup
+	// per possibile eliminazione nodi
+	votes             map[string]*voteBucket       // key = targetID
+	DeathCertificates map[string]*certificateEntry // key = targetID
+	recentlyEvicted   map[string]time.Time         // anti-rumore log/cleanup
 }
 
-// =============== Helper per death certificates ===============
-
-// ---------------- Node init ----------------
-
 func NewNode() (*Node, error) {
-	cfg, err := utils.GetNodeConfig()
-	if err != nil {
+	cfg, err := utils.GetNodeConfig() //recuper della configurazione da env del nodo
+	if err != nil {                   //senza una config corretta non si crea il nodo
 		return nil, err
 	}
 
-	udpAddr := net.UDPAddr{IP: net.IPv4zero, Port: cfg.UDPPort}
-	conn, err := net.ListenUDP("udp", &udpAddr)
+	udpAddr := net.UDPAddr{IP: net.IPv4zero, Port: cfg.UDPPort} //Apre una socket UDP
+	conn, err := net.ListenUDP("udp", &udpAddr)                 //si mette in ascolto
 	if err != nil {
 		return nil, fmt.Errorf("errore ListenUDP: %w", err)
 	}
 
-	n := &Node{
-		cfg:             cfg,
-		conn:            conn,
-		members:         make(map[string]*Member),
-		services:        make(map[string]*ServiceInstance),
-		udpPort:         cfg.UDPPort,
-		votes:           make(map[string]*voteBucket),
-		obits:           make(map[string]*obitEntry),
-		recentlyEvicted: make(map[string]time.Time),
-		httpClient:      &http.Client{Timeout: 1 * time.Second},
-		lastSvcVer:      make(map[string]uint64),
+	n := &Node{ //creo la struttura nodo con tutti i campi necessari
+		cfg:               cfg,
+		conn:              conn,
+		members:           make(map[string]*Member),               //lista di peers conosciuti
+		services:          make(map[string]*ServiceInstance),      //servizi proprietari del nodo
+		udpPort:           cfg.UDPPort,                            //la propria porta
+		votes:             make(map[string]*voteBucket),           //voti proprietari del nodo
+		DeathCertificates: make(map[string]*certificateEntry),     //certificati di morte proprietari
+		recentlyEvicted:   make(map[string]time.Time),             //lista di nodi recentemente eliminati dalla membership
+		httpClient:        &http.Client{Timeout: 1 * time.Second}, //http client per le chiamate al registry
+		lastSvcVer:        make(map[string]uint64),                //versioni viste di un servizio
 	}
 
 	now := time.Now()
-	n.members[cfg.SelfID] = &Member{
-		ID:          n.cfg.SelfID,
-		Addr:        n.cfg.SelfAddr,
-		Heartbeat:   0,
-		LastSeen:    now,
-		Incarnation: 1,
-		State:       StateAlive,
-	}
-
-	if n.cfg.APIPort != n.udpPort {
-		log.Printf("[WARN] API_PORT (%d) diverso dalla porta UDP (%d). "+
-			"Il registry restituisce indirizzi HTTP (API). Se non coincidono con l'UDP, "+
-			"il gossip verso i peer del registry potrebbe non raggiungerli. "+
-			"Valuta la stessa porta o http_addr/udp_addr nel registry.",
-			n.cfg.APIPort, n.udpPort)
+	n.members[cfg.SelfID] = &Member{ //vado a creare la entry di me stesso
+		ID:          n.cfg.SelfID,   //ID del nodo
+		Addr:        n.cfg.SelfAddr, //host:port
+		Heartbeat:   0,              //heartbeat da diffondere per mantenimento alive monotono
+		LastSeen:    now,            //necessario per rilevazione suspect/dead
+		Incarnation: 1,              //necessario casistica recover di un nodo
+		State:       StateAlive,     //stato attuale del nodo alive/suspect/dead
 	}
 	return n, nil
 }
@@ -142,11 +108,9 @@ func NewNode() (*Node, error) {
 func (n *Node) run() {
 	log.Printf("[BOOT] %s su %s | API :%d | services=%q | registry=%s | seeds=%s",
 		n.cfg.SelfID, n.cfg.SelfAddr, n.cfg.APIPort, n.cfg.ServicesCSV, n.cfg.RegistryURL, os.Getenv("SEEDS"))
-
-	// host "canonico" del nodo (ID = solo host, mai con :porta)
+	// stringa host del nodo senza la porta
 	selfHost, _, _ := strings.Cut(n.cfg.SelfAddr, ":")
-
-	// 1) Bootstrap dei peer dal registry
+	// recupero lista peer dal registry
 	if peers, err := n.bootstrapFromRegistry(); err != nil {
 		log.Printf("[ERROR] Errore nel bootstrap dal registry: %v", err)
 	} else {
@@ -155,49 +119,45 @@ func (n *Node) run() {
 			host, _, _ := strings.Cut(p, ":")
 			if host == "" || host == selfHost {
 				// salta indirizzi vuoti o riferimenti a se stesso,
-				// anche se API_PORT e porta UDP differiscono
 				continue
 			}
-
 			n.mu.Lock()
-			if m, ok := n.members[host]; ok {
-				// già presente (es. arrivato da SEEDS) → aggiorna solo l'Addr
+			if m, ok := n.members[host]; ok { //se gia presente nella membership
 				if m.Addr != p {
-					m.Addr = p
+					m.Addr = p //se il peer gia presente nella membership ma con indirizzo errato aggiorno
 				}
 				// se per qualche motivo era DEAD al boot, riportalo a SUSPECT
 				if m.State == StateDead {
 					m.State = StateSuspect
 					m.LastSeen = time.Time{}
 				}
-			} else {
+			} else { //se assente nella membership
 				// nuovo peer in vista iniziale
 				n.members[host] = &Member{
 					ID:        host, // ID canonico = solo host
 					Addr:      p,    // indirizzo completo host:porta per UDP/HTTP
 					Heartbeat: 0,
 					LastSeen:  time.Time{},
-					State:     StateSuspect,
+					State:     StateSuspect, //non conoscendone lo stato lo imposto a suspect
 				}
 			}
 			n.mu.Unlock()
 		}
 	}
 
-	// 2) Avvio goroutine di membership/failure detector
+	//avvio goroutine di membership/failure detector
 	go n.receiveLoop()
 	go n.heartbeatLoop()
 	go n.gossipLoop()
 	go n.suspicionLoop()
 
-	// 3) Avvio API HTTP (discovery + endpoint /api/membership/evict) e servizi demo
+	//avvio API HTTP e servizi demo
 	go n.startDiscoveryAPI(n.cfg.APIPort)
 	n.maybeStartDemoServices()
 
-	// 4) Manutenzione TTL servizi
 	go n.serviceRefreshLoop()
 
-	// 5) Stampa periodica della view
+	//Stampa periodicamente la view della membership
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
@@ -211,14 +171,13 @@ func (n *Node) bootstrapFromRegistry() ([]string, error) {
 	url := fmt.Sprintf("http://%s/api/join", n.cfg.RegistryURL)
 
 	// Costruisco l'addr da pubblicare al registry usando la porta HTTP API
-	// (così il registry può inviare POST /api/membership/evict a questo endpoint)
 	host, _, _ := strings.Cut(n.cfg.SelfAddr, ":")
 	joinAddr := fmt.Sprintf("%s:%d", host, n.cfg.APIPort)
 
 	// Corpo della richiesta POST con id e indirizzo HTTP del nodo
 	body := map[string]string{
 		"id":   n.cfg.SelfID,
-		"addr": joinAddr, // IMPORTANTE: indirizzo HTTP per notifiche dal registry
+		"addr": joinAddr,
 	}
 	b, _ := json.Marshal(body)
 
@@ -229,7 +188,7 @@ func (n *Node) bootstrapFromRegistry() ([]string, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	// Invio della richiesta al registry (riuso il client con timeout)
+	// Invio della richiesta al registry
 	resp, err := n.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("errore nel contattare il registry: %v", err)
@@ -240,7 +199,7 @@ func (n *Node) bootstrapFromRegistry() ([]string, error) {
 		return nil, fmt.Errorf("errore nel rispondere dal registry: status %d", resp.StatusCode)
 	}
 
-	// Decodifica della risposta JSON che contiene la lista dei peer (addr HTTP)
+	// Decodifica della risposta JSON che contiene la lista dei peer
 	var respBody struct {
 		Peers []string `json:"peers"`
 	}
@@ -248,24 +207,14 @@ func (n *Node) bootstrapFromRegistry() ([]string, error) {
 		return nil, fmt.Errorf("errore nella decodifica della risposta del registry: %v", err)
 	}
 
-	// Ritorno la lista dei peer (si assume stessa porta per UDP e HTTP)
+	// Ritorno la lista dei peer
 	return respBody.Peers, nil
-}
-
-func (n *Node) sendTo(addr string, msg GossipMessage) error {
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return err
-	}
-	b, _ := json.Marshal(msg)
-	_, err = n.conn.WriteToUDP(b, udpAddr)
-	return err
 }
 
 func (n *Node) receiveLoop() {
 	buf := make([]byte, 64*1024)
 	for {
-		nRead, src, err := n.conn.ReadFromUDP(buf)
+		nRead, src, err := n.conn.ReadFromUDP(buf) //leggo dalla porta e nel caso scrivo su buf
 		if err != nil {
 			log.Printf("[RECV-ERR] %v", err)
 			continue
@@ -274,29 +223,26 @@ func (n *Node) receiveLoop() {
 		copy(data, buf[:nRead])
 
 		var gm GossipMessage
-		if err := json.Unmarshal(data, &gm); err != nil {
+		if err := json.Unmarshal(data, &gm); err != nil { //eseguo unmarshal del messaggio
 			log.Printf("[DECODE-ERR] from %s: %v", src.String(), err)
 			continue
 		}
-
-		// 1) Applica prima i certificati e i voti (possono causare eviction/promozioni a certificato)
-		obitsApplied := n.ingestObits(gm.Obits)
+		//Applica prima i certificati e i voti
+		certApplied := n.ingestCertificates(gm.Certs)
 		votesPromoted := n.ingestVotes(gm.Votes)
-		if obitsApplied > 0 || votesPromoted > 0 {
-			log.Printf("[DEATH] obits_applied=%d, obits_promoted=%d (da %s)", obitsApplied, votesPromoted, gm.FromID)
+		if certApplied > 0 || votesPromoted > 0 {
+			log.Printf("[DEATH-CERTIFICATE] cert_applied=%d, certs_promoted=%d (da %s)", certApplied, votesPromoted, gm.FromID)
 		}
-
-		// 2) FILTRO anti-resurrezione: rimuovi dal digest membership le entry coperte da obit attivo
+		//FILTRO anti-resurrezione: rimuovi dal digest membership le entry coperte da certificato attivo
 		filtered := 0
 		func() {
 			n.mu.Lock()
 			defer n.mu.Unlock()
 			now := time.Now()
-
 			dst := gm.Membership[:0]
 			for _, s := range gm.Membership {
-				if e, ok := n.obits[s.ID]; ok && now.Before(e.ExpiresAt) {
-					// se l'evidenza del digest NON è più nuova del certificato, scarta l'entry
+				if e, ok := n.DeathCertificates[s.ID]; ok && now.Before(e.ExpiresAt) {
+					// se l'evidenza nel digest NON è più nuova del certificato, scarta l'entry
 					if !evidenceNewer(DeathEvidence{Inc: s.Incarnation, Hb: s.Heartbeat}, e.Evidence) {
 						filtered++
 						continue
@@ -307,52 +253,51 @@ func (n *Node) receiveLoop() {
 			gm.Membership = dst
 		}()
 		if filtered > 0 {
-			log.Printf("[DEATH] filtrate %d entry membership coperte da obit attivo (da %s)", filtered, gm.FromID)
+			//log.Printf("[DEATH] filtrate %d entry membership coperte da certificati attivi (da %s)", filtered, gm.FromID)
 		}
-
-		// 3) Merge come prima
+		// Merge membership e merge dei servizi
 		mu := n.mergeMembership(&gm)
 		su := n.mergeServices(&gm)
 
-		// 4) PUSH-PULL a due passi: rispondi solo se NON è una reply
-		if !gm.IsReply {
+		//PUSH-PULL
+		if !gm.IsReply { //se non è una reply allora rispondo
 			ret := strings.TrimSpace(gm.ReturnAddr)
 			if ret == "" {
-				ret = src.String() // fallback prudente sull'indirizzo UDP sorgente
+				ret = src.String()
 			}
-			// opzionale: evita di rispondere a te stesso
+			// evita di rispondere a te stesso
 			if ret != "" && ret != n.cfg.SelfAddr {
 				reply := n.buildReplyDiff(&gm)
-				if len(reply.Membership) > 0 || len(reply.Services) > 0 || len(reply.Obits) > 0 || len(reply.Votes) > 0 {
+				//se ho anche una sola differenza allora invio effettivamente la risposta altrimenti no
+				if len(reply.Membership) > 0 || len(reply.Services) > 0 || len(reply.Certs) > 0 || len(reply.Votes) > 0 {
 					if err := n.sendTo(ret, reply); err != nil {
 						log.Printf("[REPLY-ERR] to %s: %v", ret, err)
 					} else {
-						log.Printf("[REPLY] to=%s members=%d services=%d obits=%d votes=%d",
-							ret, len(reply.Membership), len(reply.Services), len(reply.Obits), len(reply.Votes))
+						//se non ho errori in fase di invio allora stampo il log
+						log.Printf("[REPLY] to=%s members=%d services=%d death-certificate=%d votes=%d",
+							ret, len(reply.Membership), len(reply.Services), len(reply.Certs), len(reply.Votes))
 					}
 				}
 
 			}
 		}
-
-		if mu+su > 0 {
-			// log.Printf("[MERGE] da=%s, membri=%d, servizi=%d", gm.FromID, mu, su)
+		if mu+su == 0 {
+			log.Printf("[MERGE] da=%s, membri=%d, servizi=%d non effettuata", gm.FromID, mu, su)
 		}
 	}
 }
 
-// ---------------- Discovery API + demo service ----------------
-
 func (n *Node) startDiscoveryAPI(port int) {
 	mux := http.NewServeMux()
 	// --- POST /service/register ---
-	// Aggiunge/refresh-a un'istanza locale e (se abilitato) scatena gossip immediato.
+	// Aggiunge/refresh-a un'istanza locale di un servizio
 	mux.HandleFunc("/service/register", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "use POST", http.StatusMethodNotAllowed)
 			return
 		}
 		var req svcRegisterReq
+		//acquisisco tutti i dettagli del servizio da registrare
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "invalid JSON body", http.StatusBadRequest)
 			return
@@ -367,7 +312,7 @@ func (n *Node) startDiscoveryAPI(port int) {
 		if req.TTL <= 0 {
 			req.TTL = n.cfg.ServiceTTL
 		}
-
+		//registro effettivamente il servizio
 		n.registerLocalService(req.Service, req.InstanceID, req.Addr, req.TTL)
 
 		w.Header().Set("Content-Type", "application/json")
@@ -375,13 +320,14 @@ func (n *Node) startDiscoveryAPI(port int) {
 	})
 
 	// --- POST /service/deregister ---
-	// Marca un'istanza locale come tombstone e (se abilitato) scatena gossip immediato.
+	// Elimina deregistrando un istanza di un servizio attivo sul nodo
 	mux.HandleFunc("/service/deregister", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "use POST", http.StatusMethodNotAllowed)
 			return
 		}
 		var req svcDeregisterReq
+		//acquisisco i dati del servizio da deregistrare
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "invalid JSON body", http.StatusBadRequest)
 			return
@@ -392,14 +338,15 @@ func (n *Node) startDiscoveryAPI(port int) {
 			http.Error(w, "missing fields: service, instance_id", http.StatusBadRequest)
 			return
 		}
-
+		//finalizzo l operazione
 		n.deregisterLocalService(req.Service, req.InstanceID)
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	})
 
-	// --- (opzionale) GET /services/local ---
+	// --- GET /services/local ---
+	//rispondo con i servizi attivi localmente sul nodo
 	mux.HandleFunc("/services/local", func(w http.ResponseWriter, r *http.Request) {
 		type out struct {
 			Service    string `json:"service"`
@@ -428,7 +375,7 @@ func (n *Node) startDiscoveryAPI(port int) {
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 
-	// --- GET /discover?service=calc (tuo handler esistente, invariato) ---
+	// --- GET /discover?service=calc ---
 	mux.HandleFunc("/discover", func(w http.ResponseWriter, r *http.Request) {
 		svc := r.URL.Query().Get("service")
 		if strings.TrimSpace(svc) == "" {
@@ -451,16 +398,16 @@ func (n *Node) startDiscoveryAPI(port int) {
 			if s.Service != svc || !s.Up || s.Tombstone {
 				continue
 			}
-			// scarta scaduti
+			// scarta i servizi che hanno superato il ttl
 			if now.Sub(s.LastUpdated) > time.Duration(s.TTLSeconds)*time.Second {
 				continue
 			}
-			// usa failure detector: il nodo ospite dev'essere ALIVE
+			// il nodo che ospita il servizio deve essere Alive
 			m, ok := n.members[s.NodeID]
-			if !ok || m.State != StateAlive {
+			if !ok || m.State != StateAlive { //se non presente nella membership o se non Alive salta
 				continue
 			}
-			out = append(out, Out{
+			out = append(out, Out{ //finalizzo la risposta
 				Service: s.Service, InstanceID: s.InstanceID, Addr: s.Addr, Node: s.NodeID, Version: s.Version,
 			})
 		}
@@ -488,7 +435,7 @@ func (n *Node) maybeStartDemoServices() {
 		s = strings.TrimSpace(s)
 		switch s {
 		case "calc":
-			go startCalcService(n, n.cfg.CalcPort)
+			go startCalcService(n, n.cfg.CalcPort) //fai partire il servizio
 		case "":
 			// no-op
 		default:
@@ -554,12 +501,9 @@ func readAB(r *http.Request) (int, int, error) {
 	return a, b, nil
 }
 
-// ---------------- Peer selection & view ----------------
-
 func (n *Node) calculateDynamicFanout() int {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-
 	// Calcola il numero di nodi ALIVE
 	aliveCount := 0
 	for _, m := range n.members {
@@ -570,7 +514,7 @@ func (n *Node) calculateDynamicFanout() int {
 	if aliveCount <= 1 {
 		return 1 // se c'è un solo nodo, fanout è 1
 	}
-	// Calcolo del fanout con scala logaritmica
+	// Calcolo del fanout con log2
 	fanout := int(math.Log2(float64(aliveCount))) + 1
 	return fanout
 }
@@ -578,86 +522,34 @@ func (n *Node) calculateDynamicFanout() int {
 func (n *Node) pickRandomTargets(k int) []*Member {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-
 	// Crea una lista di nodi ALIVE e SUSPECT
 	peers := make([]*Member, 0, len(n.members))
 	for id, m := range n.members {
 		if id == n.cfg.SelfID {
 			continue
 		}
-		if m.State == StateAlive || m.State == StateSuspect {
+		if m.State != StateDead {
 			peers = append(peers, m)
 		}
 	}
-
 	// Se non ci sono peer disponibili, ritorna nil
 	if len(peers) == 0 {
 		return nil
 	}
-
 	// Se il numero di peer è inferiore al fanoutK, ritorna tutti i peer
 	if len(peers) <= k {
 		return peers
 	}
-
-	// Se ci sono più peer di quelli che possiamo inviare, randomizza la selezione
-	rand.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
-
 	// Ritorna solo i primi 'k' peer
+	rand.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
 	return peers[:k]
 }
 
 func (n *Node) printView() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-
 	now := time.Now()
-
-	// ================== DEDUPLICA PER ADDRESS ==================
-	// Idee:
-	// - Collassiamo le entry che condividono lo stesso Addr.
-	// - Preferiamo la entry con ID "pulito" (senza ':'); a parità, quella con HB più alto,
-	//   poi quella con LastSeen più recente.
-	// - Manteniamo anche eventuali membri senza Addr (chiave fittizia "ID::<id>").
-	canonical := make(map[string]*Member, len(n.members)) // chiave: Addr oppure "ID::<id>" se Addr vuoto
-
-	for _, m := range n.members {
-		addr := strings.TrimSpace(m.Addr)
-		if addr == "" {
-			key := "ID::" + m.ID
-			if prev, ok := canonical[key]; ok {
-				// scegli il migliore per ID "orfano"
-				if m.Heartbeat > prev.Heartbeat || (m.Heartbeat == prev.Heartbeat && m.LastSeen.After(prev.LastSeen)) {
-					canonical[key] = m
-				}
-			} else {
-				canonical[key] = m
-			}
-			continue
-		}
-
-		if prev, ok := canonical[addr]; ok {
-			prevIsEndpoint := strings.Contains(prev.ID, ":")
-			curIsEndpoint := strings.Contains(m.ID, ":")
-
-			better := false
-			switch {
-			// preferisci ID senza ":" rispetto a endpoint
-			case prevIsEndpoint && !curIsEndpoint:
-				better = true
-			// a parità di "tipo" (entrambi puliti o entrambi endpoint), usa HB e recency
-			case prevIsEndpoint == curIsEndpoint &&
-				(m.Heartbeat > prev.Heartbeat || (m.Heartbeat == prev.Heartbeat && m.LastSeen.After(prev.LastSeen))):
-				better = true
-			}
-
-			if better {
-				canonical[addr] = m
-			}
-		} else {
-			canonical[addr] = m
-		}
-	}
+	//canonical := make(map[string]*Member, len(n.members))
 
 	type row struct {
 		ID          string
@@ -668,32 +560,23 @@ func (n *Node) printView() {
 		incarnation uint64
 	}
 
-	rows := make([]row, 0, len(canonical))
-	for key, m := range canonical {
+	rows := make([]row, 0, len(n.members))
+	for _, m := range n.members {
 		// Calcolo "last"
 		last := "-"
 		if !m.LastSeen.IsZero() {
 			last = time.Since(m.LastSeen).Truncate(time.Millisecond).String() + " ago"
 		}
-
-		// Ricava l'Addr anche per i "ID::" orfani
-		addr := m.Addr
-		if strings.HasPrefix(key, "ID::") && addr == "" {
-			addr = m.Addr
-		}
-
 		rows = append(rows, row{
 			ID:          m.ID,
 			St:          m.State,
 			HB:          m.Heartbeat,
 			Last:        last,
-			Addr:        addr,
+			Addr:        m.Addr,
 			incarnation: m.Incarnation,
 		})
 	}
-
 	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
-
 	// ================== INDICIZZA SERVIZI PER NODEID ==================
 	svcsByNode := make(map[string][]*ServiceInstance, len(n.services))
 	for _, s := range n.services {
@@ -707,14 +590,13 @@ func (n *Node) printView() {
 			return list[i].InstanceID < list[j].InstanceID
 		})
 	}
-
 	// ================== STAMPA ==================
 	log.Printf("[VIEW] ----- %s -----", n.cfg.SelfID)
 	for _, r := range rows {
-		// riga membro (solo canonici, niente alias duplicati)
+		// riga membro
 		log.Printf("  %-10s  %-7s  hb=%-6d  last=%-12s  %s with inc=%d", r.ID, r.St, r.HB, r.Last, r.Addr, r.incarnation)
 
-		// servizi sotto il nodo (usiamo NodeID esatto)
+		// servizi sotto il nodo
 		if list := svcsByNode[r.ID]; len(list) > 0 {
 			for _, s := range list {
 				ttl := s.TTLSeconds
@@ -723,7 +605,6 @@ func (n *Node) printView() {
 				}
 				age := now.Sub(s.LastUpdated).Truncate(time.Millisecond)
 				expired := age > time.Duration(ttl)*time.Second
-
 				status := "down"
 				switch {
 				case s.Tombstone:
@@ -735,13 +616,11 @@ func (n *Node) printView() {
 				default:
 					status = "down"
 				}
-
 				log.Printf("      └─ svc=%-10s id=%-14s %-5s ver=%-3d ttl=%-2ds age=%-8s addr=%s",
 					s.Service, s.InstanceID, status, s.Version, ttl, age, s.Addr)
 			}
 		}
 	}
-
 	// ================== RIEPILOGO SERVIZI ==================
 	type srow struct {
 		K string

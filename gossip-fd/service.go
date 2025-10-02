@@ -18,14 +18,14 @@ type svcDeregisterReq struct {
 }
 
 type ServiceAnnouncement struct {
-	Service    string `json:"service"` // es: "calc"
-	InstanceID string `json:"id"`      // es: "node1-calc"
-	NodeID     string `json:"node"`    // chi ospita
-	Addr       string `json:"addr"`    // es: "node1:18080"
+	Service    string `json:"service"` // "calc"
+	InstanceID string `json:"id"`      // "node1-calc"
+	NodeID     string `json:"node"`    // chi ospita il servizio
+	Addr       string `json:"addr"`    // "node1:18080"
 	Version    uint64 `json:"ver"`     // contatore monotono
-	TTLSeconds int    `json:"ttl"`     // es: 15
+	TTLSeconds int    `json:"ttl"`     // configurabile da env
 	Up         bool   `json:"up"`      // true se attivo
-	Tombstone  bool   `json:"tomb"`    // per rimozione (non usato molto qui)
+	Tombstone  bool   `json:"tomb"`    // segnala sevizio inattivo
 }
 
 type ServiceInstance struct {
@@ -44,10 +44,8 @@ func (n *Node) registerLocalService(service, instanceID, addr string, ttl int) {
 	now := time.Now()
 	n.mu.Lock()
 	defer n.mu.Unlock()
-
 	key := svcKey(service, instanceID)
 	cur, ok := n.services[key]
-
 	// calcola la prossima versione > max(cur.Version, lastSvcVer[key])
 	var base uint64
 	if ok && cur.Version > base {
@@ -58,13 +56,13 @@ func (n *Node) registerLocalService(service, instanceID, addr string, ttl int) {
 	}
 	nextVer := base + 1
 
-	// ttl di backup (come prima)
+	// ttl di backup
 	if ttl <= 0 {
 		ttl = 15
 	}
 
 	if !ok {
-		// nuova entry
+		// se non esiste la entry la creo
 		cur = &ServiceInstance{
 			Service:     service,
 			InstanceID:  instanceID,
@@ -90,21 +88,17 @@ func (n *Node) registerLocalService(service, instanceID, addr string, ttl int) {
 	if addr != "" {
 		cur.Addr = addr
 	}
-	cur.TTLSeconds = ttl // mantieni aggiornato anche il TTL se lo cambi
+	cur.TTLSeconds = ttl //riaggiorno anche il ttl
 	n.lastSvcVer[key] = nextVer
-
 	log.Printf("[SVC] refresh %s id=%s addr=%s ttl=%ds ver=%d", service, instanceID, cur.Addr, cur.TTLSeconds, nextVer)
 }
 
 func (n *Node) deregisterLocalService(service, instanceID string) {
 	now := time.Now()
-
 	n.mu.Lock()
 	defer n.mu.Unlock()
-
 	key := svcKey(service, instanceID)
 	cur, ok := n.services[key]
-
 	// calcola la prossima versione > max(cur.Version, lastSvcVer[key])
 	var base uint64
 	if ok && cur.Version > base {
@@ -121,9 +115,9 @@ func (n *Node) deregisterLocalService(service, instanceID string) {
 			Service:     service,
 			InstanceID:  instanceID,
 			NodeID:      n.cfg.SelfID,
-			Addr:        "", // opzionale; non serve per il tombstone
+			Addr:        "",
 			Version:     nextVer,
-			TTLSeconds:  n.cfg.ServiceTTL, // mantieni un TTL ragionevole
+			TTLSeconds:  n.cfg.ServiceTTL,
 			Up:          false,
 			Tombstone:   true,
 			LastUpdated: now,
@@ -133,12 +127,8 @@ func (n *Node) deregisterLocalService(service, instanceID string) {
 		cur.Up = false
 		cur.Tombstone = true
 		cur.LastUpdated = now
-		// (lascia cur.Addr e cur.TTLSeconds come sono; non serve modificarli)
 	}
-
-	// aggiorna la waterline
 	n.lastSvcVer[key] = nextVer
-
 	log.Printf("[SVC] deregistrato %s id=%s ver=%d", service, instanceID, nextVer)
 }
 
@@ -151,7 +141,7 @@ func (n *Node) pruneExpiredServices() {
 		if ttl == 0 {
 			ttl = 15 * time.Second
 		}
-		// se è passato oltre TTL*2 senza update, elimina
+		// se è passato oltre ttl*2 senza update, elimina
 		if now.Sub(s.LastUpdated) > 2*ttl {
 			delete(n.services, k)
 			log.Printf("[SVC] scaduto %s/%s (last=%s)", s.Service, s.InstanceID, s.LastUpdated.Format(time.RFC3339))
@@ -172,43 +162,38 @@ func (n *Node) serviceRefreshLoop() {
 			}
 		}
 		n.mu.Unlock()
-
 		for _, s := range local {
 			n.registerLocalService(s.Service, s.InstanceID, s.Addr, s.TTLSeconds)
 		}
 	}
 }
 
+// merge dei servizi ricevuti tramite gossipmessage
 func (n *Node) mergeServices(gm *GossipMessage) int {
-	now := time.Now() // usato solo localmente per l'ultimo "heard"
+	now := time.Now()
 	updated := 0
-
 	n.mu.Lock()
 	defer n.mu.Unlock()
-
 	for _, ann := range gm.Services {
 		key := svcKey(ann.Service, ann.InstanceID)
 		cur, ok := n.services[key]
 
-		// monotonicità globale: scarta se la versione è <= dell'ultima vista
+		// scarta se la versione è <= dell'ultima vista (monotono)
 		last := n.lastSvcVer[key]
 		if ann.Version <= last {
-			// NOTA: se vuoi che announce a stessa versione fungano da "keepalive",
-			// puoi rimuovere questo check o gestire un ramo speciale per il solo refresh del LastUpdated.
 			continue
 		}
-		// ridondante ma sicuro: se esiste cur e la versione non supera cur.Version, ignora
+		//se io ho una versione più aggiornata ignora
 		if ok && ann.Version <= cur.Version {
 			continue
 		}
-
-		// normalizza TTL (durata locale, non timestamp)
 		ttl := ann.TTLSeconds
 		if ttl <= 0 {
 			ttl = n.cfg.ServiceTTL
 		}
 
 		up := ann.Up && !ann.Tombstone
+		//aggiorno l entry locale
 		inst := &ServiceInstance{
 			Service:     ann.Service,
 			InstanceID:  ann.InstanceID,
@@ -218,12 +203,9 @@ func (n *Node) mergeServices(gm *GossipMessage) int {
 			TTLSeconds:  ttl,
 			Up:          up,
 			Tombstone:   ann.Tombstone,
-			LastUpdated: now, // solo clock locale
+			LastUpdated: now,
 		}
-
 		n.services[key] = inst
-
-		// aggiorna la waterline di versione
 		if ann.Version > n.lastSvcVer[key] {
 			n.lastSvcVer[key] = ann.Version
 		}

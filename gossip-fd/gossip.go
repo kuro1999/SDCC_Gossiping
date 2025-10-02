@@ -1,11 +1,25 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
+	"net"
 	"sort"
 	"time"
 )
 
+type deadEv struct {
+	id  string
+	inc uint64
+	hb  uint64
+}
+type tr struct {
+	old      MemberState
+	new      MemberState
+	id       string
+	lastSeen time.Time
+	delta    time.Duration
+}
 type GossipMessage struct {
 	FromID     string                `json:"from_id"`
 	ReturnAddr string                `json:"ret_addr"`
@@ -13,11 +27,12 @@ type GossipMessage struct {
 	Membership []MemberSummary       `json:"membership"`
 	Services   []ServiceAnnouncement `json:"services"`
 
-	// NEW: piggyback di voti e certificati
-	Votes []DeathVote `json:"votes,omitempty"`
-	Obits []Obituary  `json:"obits,omitempty"`
+	//piggyback di voti e certificati
+	Votes []DeathVote        `json:"votes,omitempty"`
+	Certs []DeathCertificate `json:"certs,omitempty"`
 }
 
+// ogni gossipinterval faccio gossip
 func (n *Node) gossipLoop() {
 	t := time.NewTicker(n.cfg.GossipInterval)
 	defer t.Stop()
@@ -26,11 +41,12 @@ func (n *Node) gossipLoop() {
 		select {
 		case <-t.C:
 			n.sendGossip()
-			n.gcDeathMeta() // pulizia voti/obits scaduti ad ogni tick
+			n.gcDeathMeta() // pulizia voti/certificati scaduti
 		}
 	}
 }
 
+// ogni heartbeat interval aggiorno il mio stato in modo che al prossimo gossip loop aggiorno il mio stato con gli altri peers
 func (n *Node) heartbeatLoop() {
 	t := time.NewTicker(n.cfg.HeartbeatInterval)
 	defer t.Stop()
@@ -51,55 +67,41 @@ func (n *Node) suspicionLoop() {
 
 	for range t.C {
 		now := time.Now()
-
-		// raccolgo le transizioni SENZA fare I/O durante il lock
-		type tr struct {
-			old      MemberState
-			new      MemberState
-			id       string
-			lastSeen time.Time
-			delta    time.Duration
-		}
 		var transitions []tr
 		deadTriggers := 0
 
-		// NEW: raccoglitore dei peer appena diventati DEAD con la loro evidenza (inc,hb)
-		type deadEv struct {
-			id  string
-			inc uint64
-			hb  uint64
-		}
+		// raccoglitore dei peer appena diventati DEAD con la loro evidenza (inc,hb)
 		var localDead []deadEv
-
-		// --- sezione critica minima ---
 		n.mu.Lock()
 		for id, m := range n.members {
+			//salto me stesso oppure se il membro è già morto
 			if id == n.cfg.SelfID || m.State == StateDead {
 				continue
 			}
+			//se ho appena visto il membro salto
 			if m.LastSeen.IsZero() {
 				continue
 			}
-
-			d := now.Sub(m.LastSeen)
+			delta := now.Sub(m.LastSeen) //da quanto non ricevo aggiornamenti
 			old := m.State
 			newSt := old
-
-			if d > n.cfg.DeadTimeout {
+			//se non lo vedo da più tempo del timeout allora lo dichiaro Dead
+			if delta > n.cfg.DeadTimeout {
 				newSt = StateDead
-			} else if d > n.cfg.SuspectTimeout {
+				//se non lo vedo da più tempo di SuspectTimeout allora lo dichiaro Suspect
+			} else if delta > n.cfg.SuspectTimeout {
 				newSt = StateSuspect
+				//altrimenti Alive
 			} else {
 				newSt = StateAlive
 			}
-
+			//se gli stati differiscono allora eseguo transizione di stato
 			if newSt != old {
 				m.State = newSt
 				transitions = append(transitions, tr{
-					old: old, new: newSt, id: id, lastSeen: m.LastSeen, delta: d,
+					old: old, new: newSt, id: id, lastSeen: m.LastSeen, delta: delta,
 				})
-
-				// NEW: se passa a DEAD, snapshotta l'evidenza per emettere un voto (fuori lock)
+				// se passa a DEAD, raccoglie l'evidenza per emettere un voto
 				if newSt == StateDead {
 					localDead = append(localDead, deadEv{
 						id:  id,
@@ -111,76 +113,74 @@ func (n *Node) suspicionLoop() {
 			}
 		}
 		n.mu.Unlock()
-		// --- fine sezione critica ---
-
-		// logging delle transizioni (fuori lock)
+		// logging delle transizioni
 		for _, x := range transitions {
 			log.Printf("[STATE] %s -> %s (peer=%s, lastSeen=%s, Δ=%s)",
 				x.old, x.new, x.id, x.lastSeen.Format(time.RFC3339), x.delta.Truncate(time.Millisecond))
 			if x.new == StateDead {
-				// Aggiorna il messaggio: niente immediate gossip, ora usiamo piggyback con priorità
-				log.Printf("[EVENTO] Nodo %s è diventato DEAD. Emesso voto locale (piggyback nei prossimi round).", x.id)
+				log.Printf("[EVENTO] Nodo %s è diventato DEAD. Emesso voto locale.", x.id)
 			}
 		}
-		// NEW: emetti i voti locali (uno per ciascun peer appena marcato DEAD)
+		//emessione dei voti locali
 		for _, d := range localDead {
 			n.recordLocalVote(d.id, DeathEvidence{Inc: d.inc, Hb: d.hb})
-			// LOG: voto locale emesso
 			log.Printf("[VOTE] emesso voto locale per %s (inc=%d hb=%d)", d.id, d.inc, d.hb)
 		}
 		if len(localDead) > 0 {
 			log.Printf("[VOTE] emessi %d voti locali (Δ=%s, K=%d)", len(localDead), n.cfg.VoteWindow, n.cfg.QuorumK)
 		}
-
-		// scadenze servizi (fa lock al suo interno)
+		// elimina servizi scaduti
 		n.pruneExpiredServices()
 	}
 }
 
 func (n *Node) sendGossip() {
-
-	// 1) Calcolo fanout dinamico
+	//calcolo fanout dinamico
 	fanoutK := n.calculateDynamicFanout()
-	if fanoutK <= 0 {
-		return // niente log rumoroso se non inviamo
-	}
-
-	// 2) Scelta target
+	//Scelta target
 	targets := n.pickRandomTargets(fanoutK)
 	if len(targets) == 0 {
 		return
 	}
-
-	// 3) Costruzione messaggio (una volta sola)
+	//costruisco il  messaggio
 	msg := n.buildMessage(false)
-
-	// 4) Logging essenziale del batch PRIMA dell’invio
 	log.Printf("[GOSSIP] send fanout=%d targets=%d", fanoutK, len(targets))
-
-	// 5) Invio concorrente (fire-and-forget), con cattura sicura dei parametri
+	// invio ai target il gossip message
 	for _, peer := range targets {
 		addr := peer.Addr // copia locale per evitare la cattura del puntatore
-		go func(a string) {
-			// difesa extra: non lasciare che un panic in un goroutine uccida il processo
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("[GOSSIP] panic while sending to %s: %v", a, r)
-				}
-			}()
-			if err := n.sendTo(a, msg); err != nil {
-				log.Printf("[GOSSIP] send-err addr=%s err=%v", a, err)
-			}
-		}(addr)
+		go n.sendGossipMessage(addr, msg)
 	}
 }
 
-// buildReplyDiff costruisce una reply "diff-only" senza usare timestamp.
-// Confronta solo heartbeat (membership) e version/up (services).
+// Funzione separata per inviare il messaggio e gestire il panic
+func (n *Node) sendGossipMessage(addr string, msg GossipMessage) {
+	defer func() {
+		//check anti panico
+		if r := recover(); r != nil {
+			log.Printf("[GOSSIP] panic while sending to %s: %v", addr, r)
+		}
+	}()
+	// Invio del messaggio
+	if err := n.sendTo(addr, msg); err != nil {
+		log.Printf("[GOSSIP] send-err addr=%s err=%v", addr, err)
+	}
+}
+
+func (n *Node) sendTo(addr string, msg GossipMessage) error {
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return err
+	}
+	b, _ := json.Marshal(msg)              //faccio il marshal del messaggio
+	_, err = n.conn.WriteToUDP(b, udpAddr) //invio effettivo del messaggio
+	return err
+}
+
+// buildReplyDiff costruisce una reply "diff-only" con la stessa logica di buildMessage
 func (n *Node) buildReplyDiff(gm *GossipMessage) GossipMessage {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	// --- indicizza ciò che il mittente dichiara di sapere ---
 	seenHB := make(map[string]MemberSummary, len(gm.Membership))
 	for _, s := range gm.Membership {
 		seenHB[s.ID] = s
@@ -193,7 +193,6 @@ func (n *Node) buildReplyDiff(gm *GossipMessage) GossipMessage {
 		seenSvcUp[key] = a.Up && !a.Tombstone
 	}
 
-	// --- membership: includi solo entry mancanti o con HB/stato più "forte" ---
 	ms := make([]MemberSummary, 0, len(n.members))
 	for _, m := range n.members {
 		s, ok := seenHB[m.ID]
@@ -206,13 +205,12 @@ func (n *Node) buildReplyDiff(gm *GossipMessage) GossipMessage {
 				ID:          m.ID,
 				Addr:        m.Addr,
 				Heartbeat:   m.Heartbeat,
-				Incarnation: m.Incarnation, // NEW
+				Incarnation: m.Incarnation,
 				State:       m.State,
 			})
 		}
 	}
 
-	// Alive prima, poi heartbeat decrescente; fallback deterministico
 	sort.Slice(ms, func(i, j int) bool {
 		ai, aj := ms[i].State == StateAlive, ms[j].State == StateAlive
 		if ai != aj {
@@ -230,7 +228,6 @@ func (n *Node) buildReplyDiff(gm *GossipMessage) GossipMessage {
 		ms = ms[:n.cfg.MaxDigestPeers]
 	}
 
-	// --- services: includi solo (service,instance) mancanti o con Version maggiore o flip di stato ---
 	sa := make([]ServiceAnnouncement, 0, len(n.services))
 	for _, s := range n.services {
 		key := svcKey(s.Service, s.InstanceID)
@@ -241,7 +238,7 @@ func (n *Node) buildReplyDiff(gm *GossipMessage) GossipMessage {
 		if s.Version > lastKnownVer || thisUp != lastKnownUp {
 			ttl := s.TTLSeconds
 			if ttl <= 0 {
-				ttl = n.cfg.ServiceTTL // fallback locale; non dipende da orologi remoti
+				ttl = n.cfg.ServiceTTL
 			}
 			sa = append(sa, ServiceAnnouncement{
 				Service:    s.Service,
@@ -255,10 +252,9 @@ func (n *Node) buildReplyDiff(gm *GossipMessage) GossipMessage {
 			})
 		}
 	}
-	obits := n.selectObitsLocked(n.cfg.MaxObitDigest)
+	certs := n.selectCertsLocked(n.cfg.MaxCertDigest)
 	votes := n.selectVotesLocked(n.cfg.MaxVoteDigest)
 
-	// Up prima, poi versione decrescente; fallback deterministico
 	sort.Slice(sa, func(i, j int) bool {
 		if sa[i].Up != sa[j].Up {
 			return sa[i].Up && !sa[j].Up
@@ -281,46 +277,44 @@ func (n *Node) buildReplyDiff(gm *GossipMessage) GossipMessage {
 		IsReply:    true,
 		Membership: ms,
 		Services:   sa,
-		Obits:      obits, // NEW
-		Votes:      votes, // NEW
+		Certs:      certs,
+		Votes:      votes,
 	}
 }
 
 func (n *Node) buildMessage(isReply bool) GossipMessage {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-
-	// --- membership digest (senza timestamp) ---
+	// --- membership digest ---
 	sums := make([]MemberSummary, 0, len(n.members))
 	for _, m := range n.members {
 		sums = append(sums, MemberSummary{
 			ID:          m.ID,
 			Addr:        m.Addr,
 			Heartbeat:   m.Heartbeat,
-			Incarnation: m.Incarnation, // NEW
+			Incarnation: m.Incarnation,
 			State:       m.State,
 		})
 	}
-
-	// Alive prima, poi heartbeat decrescente; fallback deterministico su Incarnation, hb
+	// riordino in base alle novità ed invio solo quelle più nuove con delle priorità
 	sort.Slice(sums, func(i, j int) bool {
 		ai, aj := sums[i].State == StateAlive, sums[j].State == StateAlive
 		if ai != aj {
-			return ai && !aj
+			return ai && !aj //se un nodo non è alive
 		}
 		if sums[i].Incarnation != sums[j].Incarnation {
-			return sums[i].Incarnation > sums[j].Incarnation
+			return sums[i].Incarnation > sums[j].Incarnation //se vi sono incarnation maggiori
 		}
 		if sums[i].Heartbeat != sums[j].Heartbeat {
-			return sums[i].Heartbeat > sums[j].Heartbeat
+			return sums[i].Heartbeat > sums[j].Heartbeat //per heartbeat maggiore
 		}
-		return sums[i].ID < sums[j].ID
+		return sums[i].ID < sums[j].ID //nel caso riordino per ID
 	})
 	if len(sums) > n.cfg.MaxDigestPeers {
 		sums = sums[:n.cfg.MaxDigestPeers]
 	}
 
-	// --- service digest (senza timestamp) ---
+	// --- service digest ---
 	sann := make([]ServiceAnnouncement, 0, len(n.services))
 	for _, s := range n.services {
 		sann = append(sann, ServiceAnnouncement{
@@ -329,13 +323,12 @@ func (n *Node) buildMessage(isReply bool) GossipMessage {
 			NodeID:     s.NodeID,
 			Addr:       s.Addr,
 			Version:    s.Version,
-			TTLSeconds: s.TTLSeconds, // ok: è una durata, non un timestamp
+			TTLSeconds: s.TTLSeconds,
 			Up:         s.Up,
 			Tombstone:  s.Tombstone,
 		})
 	}
-
-	// Up prima, poi versione decrescente; fallback deterministico
+	//riordino in base all importanza degli aggiornamenti
 	sort.Slice(sann, func(i, j int) bool {
 		if sann[i].Up != sann[j].Up {
 			return sann[i].Up && !sann[j].Up
@@ -351,8 +344,8 @@ func (n *Node) buildMessage(isReply bool) GossipMessage {
 	if len(sann) > n.cfg.MaxServiceDigest {
 		sann = sann[:n.cfg.MaxServiceDigest]
 	}
-	// ====== piggyback obits e votes ======
-	obits := n.selectObitsLocked(n.cfg.MaxObitDigest)
+	// ====== piggyback certs e votes ======
+	certs := n.selectCertsLocked(n.cfg.MaxCertDigest)
 	votes := n.selectVotesLocked(n.cfg.MaxVoteDigest)
 
 	return GossipMessage{
@@ -361,19 +354,17 @@ func (n *Node) buildMessage(isReply bool) GossipMessage {
 		IsReply:    isReply,
 		Membership: sums,
 		Services:   sann,
-		Obits:      obits, // NEW
-		Votes:      votes, // NEW
+		Certs:      certs,
+		Votes:      votes,
 	}
 }
 
 func (n *Node) mergeMembership(gm *GossipMessage) int {
 	now := time.Now()
 	updated := 0
-
 	n.mu.Lock()
 	defer n.mu.Unlock()
-
-	// --- SELF-BUMP: se i peer mi riportano con una inc >= della mia, salto avanti ---
+	// --- SELF-BUMP: se i peer mi riportano con una inc >= della mia, salto avanti (non sapevo di essere morto)---
 	self := n.members[n.cfg.SelfID]
 	for _, s := range gm.Membership {
 		if s.ID != n.cfg.SelfID {
@@ -381,7 +372,7 @@ func (n *Node) mergeMembership(gm *GossipMessage) int {
 		}
 		if s.Incarnation > self.Incarnation || (s.Incarnation == self.Incarnation && s.State != StateAlive) {
 			oldInc := self.Incarnation
-			self.Incarnation = s.Incarnation + 1 // NEW: nuova "vita"
+			self.Incarnation = s.Incarnation + 1 // nuova "vita"
 			self.Heartbeat = 0                   // riparti da 0
 			self.State = StateAlive
 			self.LastSeen = now
@@ -389,8 +380,6 @@ func (n *Node) mergeMembership(gm *GossipMessage) int {
 			log.Printf("[SELF-BUMP] inc %d -> %d (refuting old view)", oldInc, self.Incarnation)
 		}
 	}
-
-	// --- mittente come prima (bootstrap morbido) ---
 	if gm.FromID != "" {
 		if _, ok := n.members[gm.FromID]; !ok {
 			n.members[gm.FromID] = &Member{
@@ -405,13 +394,11 @@ func (n *Node) mergeMembership(gm *GossipMessage) int {
 			updated++
 		}
 	}
-
-	// --- merge degli altri membri con ordine (inc, hb) ---
+	// --- merge degli altri membri (inc, hb) ---
 	for _, s := range gm.Membership {
 		if s.ID == n.cfg.SelfID {
 			continue
-		} // già gestito sopra
-
+		}
 		m, ok := n.members[s.ID]
 		if !ok {
 			m = &Member{ID: s.ID, Addr: s.Addr}
@@ -423,10 +410,8 @@ func (n *Node) mergeMembership(gm *GossipMessage) int {
 			m.Addr = s.Addr
 			updated++
 		}
-
-		// Accetta solo se (inc, hb) è più nuovo
-		if s.Incarnation > m.Incarnation ||
-			(s.Incarnation == m.Incarnation && s.Heartbeat > m.Heartbeat) {
+		// Accetta solo se (inc, hb) è più alto
+		if s.Incarnation > m.Incarnation || (s.Incarnation == m.Incarnation && s.Heartbeat > m.Heartbeat) {
 			old := m.State
 			m.Incarnation = s.Incarnation
 			m.Heartbeat = s.Heartbeat
@@ -437,9 +422,6 @@ func (n *Node) mergeMembership(gm *GossipMessage) int {
 			}
 			updated++
 		}
-
-		// niente degradazioni su stato remoto: lasciale al tuo FD locale
 	}
-
 	return updated
 }
