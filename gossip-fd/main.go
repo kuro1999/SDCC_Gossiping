@@ -11,7 +11,6 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -53,11 +52,12 @@ type Node struct {
 	mu      sync.Mutex
 	members map[string]*Member
 
-	// service registry
-	services   map[string]*ServiceInstance // key = svcKey
-	selfHB     uint64
-	udpPort    int
-	lastSvcVer map[string]uint64 // ultima versione vista per chiave
+	// servizi
+	services    map[string]*ServiceInstance // key = svcKey
+	selfHB      uint64
+	udpPort     int
+	lastSvcVer  map[string]uint64 // ultima versione vista per chiave
+	calcStarted bool
 
 	//registry
 	httpClient *http.Client // client HTTP con timeout
@@ -106,8 +106,8 @@ func NewNode() (*Node, error) {
 }
 
 func (n *Node) run() {
-	log.Printf("[BOOT] %s su %s | API :%d | services=%q | registry=%s | seeds=%s",
-		n.cfg.SelfID, n.cfg.SelfAddr, n.cfg.APIPort, n.cfg.ServicesCSV, n.cfg.RegistryURL, os.Getenv("SEEDS"))
+	log.Printf("[BOOT] %s su %s | API :%d | services=%q | registry=%s",
+		n.cfg.SelfID, n.cfg.SelfAddr, n.cfg.APIPort, n.cfg.ServicesCSV, n.cfg.RegistryURL)
 	// stringa host del nodo senza la porta
 	selfHost, _, _ := strings.Cut(n.cfg.SelfAddr, ":")
 	// recupero lista peer dal registry
@@ -314,7 +314,12 @@ func (n *Node) startDiscoveryAPI(port int) {
 		}
 		//registro effettivamente il servizio
 		n.registerLocalService(req.Service, req.InstanceID, req.Addr, req.TTL)
-
+		// se mi registrano "calc" su questo nodo, accendo l'HTTP service calc
+		if req.Service == "calc" && !n.calcStarted {
+			n.calcStarted = true
+			go startCalcService(n, port, false) // false: niente auto-register
+			log.Printf("[SVC] avviato calc su :%d in seguito a /service/register", port)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	})
@@ -435,7 +440,7 @@ func (n *Node) maybeStartDemoServices() {
 		s = strings.TrimSpace(s)
 		switch s {
 		case "calc":
-			go startCalcService(n, n.cfg.CalcPort) //fai partire il servizio
+			go startCalcService(n, n.cfg.CalcPort, true) //fai partire il servizio
 		case "":
 			// no-op
 		default:
@@ -444,34 +449,57 @@ func (n *Node) maybeStartDemoServices() {
 	}
 }
 
-func startCalcService(n *Node, port int) {
+func (n *Node) isServiceActive(svc string) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	now := time.Now()
+	for _, s := range n.services {
+		if s.Service != svc || s.NodeID != n.cfg.SelfID {
+			continue
+		}
+		// attivo se Up, non tombstone, e non scaduto
+		if s.Up && !s.Tombstone {
+			if now.Before(s.ExpiresAt) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func startCalcService(n *Node, port int, autoRegister bool) {
 	mux := http.NewServeMux()
 
-	// GET /sum?a=1&b=2
 	mux.HandleFunc("/sum", func(w http.ResponseWriter, r *http.Request) {
 		a, b, err := readAB(r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		if !n.isServiceActive("calc") {
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		fmt.Fprintf(w, "%d\n", a+b)
 	})
 
-	// GET /sub?a=5&b=3
 	mux.HandleFunc("/sub", func(w http.ResponseWriter, r *http.Request) {
 		a, b, err := readAB(r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		if !n.isServiceActive("calc") {
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		fmt.Fprintf(w, "%d\n", a-b)
 	})
 
 	addr := fmt.Sprintf("%s:%d", strings.Split(n.cfg.SelfAddr, ":")[0], port)
-	go func() {
-		// registra l'istanza locale
-		n.registerLocalService("calc", n.cfg.SelfID+"-calc", addr, n.cfg.ServiceTTL)
-	}()
+	if autoRegister {
+		go n.registerLocalService("calc", n.cfg.SelfID+"-calc", addr, n.cfg.ServiceTTL)
+	}
 
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", port),
@@ -620,21 +648,6 @@ func (n *Node) printView() {
 					s.Service, s.InstanceID, status, s.Version, ttl, age, s.Addr)
 			}
 		}
-	}
-	// ================== RIEPILOGO SERVIZI ==================
-	type srow struct {
-		K string
-		S ServiceInstance
-	}
-	srows := make([]srow, 0, len(n.services))
-	for k, v := range n.services {
-		srows = append(srows, srow{K: k, S: *v})
-	}
-	sort.Slice(srows, func(i, j int) bool { return srows[i].K < srows[j].K })
-	for _, sr := range srows {
-		age := time.Since(sr.S.LastUpdated).Truncate(time.Millisecond)
-		log.Printf("  [SVC] %-18s id=%-14s up=%-5v ver=%-3d ttl=%-2ds age=%-8s addr=%s node=%s",
-			sr.S.Service, sr.S.InstanceID, sr.S.Up, sr.S.Version, sr.S.TTLSeconds, age, sr.S.Addr, sr.S.NodeID)
 	}
 }
 

@@ -1,80 +1,95 @@
 #!/usr/bin/env bash
-set -euo pipefail
 
-# ===== Config essenziale (override via env) =====
-: "${DISCOVERY_NODES:=node1:9000,node2:9001,node3:9002}"  # nodi API (host:port) - Opzione 1
-: "${SERVICE:=calc}"                                       # servizio target
-: "${OP:=sum}"                                             # operazione da invocare
-: "${A:=1}" : "${B:=2}"                                    # parametri per l'operazione
-: "${STARTUP_WAIT:=2}"                                     # attesa iniziale (s)
-: "${REG_TTL:=15}"                                         # TTL per la register
-: "${REG_ID_PREFIX:=dyn}"                                  # prefisso instance id
-: "${REMOVE_DELAY:=10}"                                    # attesa prima della deregister (s)
+# =======================
+# Parametri configurabili
+# =======================
 
-# ===== Derivate minime =====
-API_NODE="${DISCOVERY_NODES%%,*}"          # primo nodo della lista
-HOST="${API_NODE%%:*}"                      # es. "node3"
-CALC_PORT="1808${HOST#node}"                # euristica: nodeX -> :1808X
-GUESS_ADDR="${HOST}:${CALC_PORT}"          # addr stimato per il servizio
-INSTANCE="${REG_ID_PREFIX}-${HOST}"        # id deterministico
+# Durata della pausa tra gli step
+PAUSE_SECS=2
 
-echo "$(date -Iseconds) [BOOT] wait ${STARTUP_WAIT}s"
-sleep "$STARTUP_WAIT"
+echo "===== [BOOTSTRAP] Avvio sequenza test ====="
+sleep $PAUSE_SECS
 
-echo "$(date -Iseconds) [DISCOVER] node=${API_NODE} service=${SERVICE}"
-ADDR="$(curl -sS "http://${API_NODE}/discover?service=${SERVICE}" | jq -r '.[0].addr // empty' || true)"
+# Messaggio di bootstrap
+echo "[BOOTSTRAP] Inizio bootstrap della rete..."
+sleep $PAUSE_SECS
+
+# Chiamata al servizio 'sum' su node1
+echo "[STEP] Chiamo servizio SUM su node1..."
+ADDR="$(curl -sS "http://node1:9000/discover?service=calc" | jq -r '.[0].addr // empty' || true)"
 if [ -n "${ADDR}" ]; then
-  URL="http://${ADDR}/${OP}?a=${A}&b=${B}"
+  URL="http://${ADDR}/sum?a=5&b=5"
   echo "$(date -Iseconds) [CALL] ${URL}"
   RESP="$(curl -sS "${URL}" || true)"
   echo "$(date -Iseconds) [CALL][DONE] result=${RESP}"
 else
   echo "$(date -Iseconds) [DISCOVER][WARN] nessun indirizzo trovato"
 fi
+sleep $PAUSE_SECS
 
-echo "$(date -Iseconds) [REGISTER] node=${API_NODE} service=${SERVICE} id=${INSTANCE} addr=${GUESS_ADDR} ttl=${REG_TTL}"
-REG_CODE="$(curl -sS -o /dev/null -w "%{http_code}" -X POST "http://${API_NODE}/service/register" \
+# Registrazione del servizio 'calc' su node1
+echo "[STEP] Registro servizio SUB su node1..."
+REG_CODE="$(curl -sS -o /dev/null -w "%{http_code}" -X POST "http://node1:9000/service/register" \
   -H 'Content-Type: application/json' \
-  -d "{\"service\":\"${SERVICE}\",\"instance_id\":\"${INSTANCE}\",\"addr\":\"${GUESS_ADDR}\",\"ttl\":${REG_TTL}}")"
+  -d "{\"service\":\"calc\",\"instance_id\":\"dyn-node1\",\"addr\":\"node1:18080\",\"ttl\":15}")"
 if [ "${REG_CODE}" = "200" ]; then
   echo "$(date -Iseconds) [REGISTER][OK] http=${REG_CODE}"
 else
   echo "$(date -Iseconds) [REGISTER][ERR] http=${REG_CODE}"
 fi
+sleep $PAUSE_SECS
 
-sleep "$STARTUP_WAIT"
-echo "$(date -Iseconds) [DISCOVER] node=${API_NODE} service=${SERVICE}"
-ADDR="$(curl -sS "http://${API_NODE}/discover?service=${SERVICE}" | jq -r '.[0].addr // empty' || true)"
+
+# Chiamata al servizio 'sum' su node1
+echo "[STEP] Chiamo servizio SUM su node1..."
+ADDR="$(curl -sS "http://node1:9000/discover?service=calc" | jq -r '.[0].addr // empty' || true)"
 if [ -n "${ADDR}" ]; then
-  URL="http://${ADDR}/${OP}?a=${A}&b=${B}"
+  URL="http://${ADDR}/sum?a=5&b=5"
   echo "$(date -Iseconds) [CALL] ${URL}"
   RESP="$(curl -sS "${URL}" || true)"
   echo "$(date -Iseconds) [CALL][DONE] result=${RESP}"
 else
   echo "$(date -Iseconds) [DISCOVER][WARN] nessun indirizzo trovato"
 fi
+sleep $PAUSE_SECS
 
-echo "$(date -Iseconds) [WAIT] remove in ${REMOVE_DELAY}s"
-sleep "$REMOVE_DELAY"
+# Chiamata al servizio 'sub'
+echo "[STEP] Chiamo servizio SUB su node1..."
+ADDR="$(curl -sS "http://node1:9000/discover?service=calc" | jq -r '.[0].addr // empty' || true)"
+if [ -n "${ADDR}" ]; then
+  URL="http://${ADDR}/sub?a=5&b=4"
+  echo "$(date -Iseconds) [CALL] ${URL}"
+  RESP="$(curl -sS "${URL}" || true)"
+  echo "$(date -Iseconds) [CALL][DONE] result=${RESP}"
+else
+  echo "$(date -Iseconds) [DISCOVER][WARN] nessun indirizzo trovato"
+fi
+sleep $PAUSE_SECS
 
-echo "$(date -Iseconds) [DEREG] node=${API_NODE} service=${SERVICE} id=${INSTANCE}"
-DEREG_CODE="$(curl -sS -o /dev/null -w "%{http_code}" -X POST "http://${API_NODE}/service/deregister" \
+# Deregistra il servizio 'calc'
+echo "[STEP] Deregistro servizio SUB..."
+DEREG_CODE="$(curl -sS -o /dev/null -w "%{http_code}" -X POST "http://node1:9000/service/deregister" \
   -H 'Content-Type: application/json' \
-  -d "{\"service\":\"${SERVICE}\",\"instance_id\":\"${INSTANCE}\"}")"
+  -d "{\"service\":\"calc\",\"instance_id\":\"dyn-node1\",\"addr\":\"node1:18080\"}")"
 if [ "${DEREG_CODE}" = "200" ]; then
   echo "$(date -Iseconds) [DEREG][OK] http=${DEREG_CODE}"
 else
   echo "$(date -Iseconds) [DEREG][ERR] http=${DEREG_CODE}"
 fi
+sleep $PAUSE_SECS
 
-sleep "$STARTUP_WAIT"
-echo "$(date -Iseconds) [DISCOVER] node=${API_NODE} service=${SERVICE}"
-ADDR="$(curl -sS "http://${API_NODE}/discover?service=${SERVICE}" | jq -r '.[0].addr // empty' || true)"
+
+# Chiamata al servizio 'sum' su node1
+echo "[STEP] Chiamo servizio SUM su node1..."
+ADDR="$(curl -sS "http://node1:9000/discover?service=calc" | jq -r '.[0].addr // empty' || true)"
 if [ -n "${ADDR}" ]; then
-  URL="http://${ADDR}/${OP}?a=${A}&b=${B}"
+  URL="http://${ADDR}/sum?a=5&b=5"
   echo "$(date -Iseconds) [CALL] ${URL}"
   RESP="$(curl -sS "${URL}" || true)"
   echo "$(date -Iseconds) [CALL][DONE] result=${RESP}"
 else
   echo "$(date -Iseconds) [DISCOVER][WARN] nessun indirizzo trovato"
 fi
+sleep $PAUSE_SECS
+
+echo "===== [FINE] Sequenza completata ====="

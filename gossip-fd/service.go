@@ -37,6 +37,7 @@ type ServiceInstance struct {
 	TTLSeconds  int
 	Up          bool
 	LastUpdated time.Time
+	ExpiresAt   time.Time
 	Tombstone   bool
 }
 
@@ -51,18 +52,14 @@ func (n *Node) registerLocalService(service, instanceID, addr string, ttl int) {
 	if ok && cur.Version > base {
 		base = cur.Version
 	}
-	if n.lastSvcVer[key] > base {
-		base = n.lastSvcVer[key]
+	if v := n.lastSvcVer[key]; v > base {
+		base = v
 	}
 	nextVer := base + 1
-
-	// ttl di backup
-	if ttl <= 0 {
-		ttl = 15
-	}
+	ttlDur := time.Duration(ttl) * time.Second
 
 	if !ok {
-		// se non esiste la entry la creo
+		// nuova entry locale
 		cur = &ServiceInstance{
 			Service:     service,
 			InstanceID:  instanceID,
@@ -72,11 +69,14 @@ func (n *Node) registerLocalService(service, instanceID, addr string, ttl int) {
 			TTLSeconds:  ttl,
 			Up:          true,
 			Tombstone:   false,
-			LastUpdated: now,
+			LastUpdated: now,             // solo per metriche/log
+			ExpiresAt:   now.Add(ttlDur), // vero deadline locale
 		}
 		n.services[key] = cur
 		n.lastSvcVer[key] = nextVer
-		log.Printf("[SVC] registrato %s id=%s addr=%s ttl=%ds ver=%d", service, instanceID, addr, ttl, nextVer)
+
+		log.Printf("[SVC] registrato %s id=%s addr=%s ttl=%ds ver=%d",
+			service, instanceID, addr, ttl, nextVer)
 		return
 	}
 
@@ -85,12 +85,17 @@ func (n *Node) registerLocalService(service, instanceID, addr string, ttl int) {
 	cur.Up = true
 	cur.Tombstone = false
 	cur.LastUpdated = now
-	if addr != "" {
+	cur.TTLSeconds = ttl
+	cur.ExpiresAt = now.Add(ttlDur) // estensione della deadline locale
+
+	if addr != "" && addr != cur.Addr {
 		cur.Addr = addr
 	}
-	cur.TTLSeconds = ttl //riaggiorno anche il ttl
+
 	n.lastSvcVer[key] = nextVer
-	log.Printf("[SVC] refresh %s id=%s addr=%s ttl=%ds ver=%d", service, instanceID, cur.Addr, cur.TTLSeconds, nextVer)
+
+	log.Printf("[SVC] refresh %s id=%s addr=%s ttl=%ds ver=%d",
+		service, instanceID, cur.Addr, cur.TTLSeconds, nextVer)
 }
 
 func (n *Node) deregisterLocalService(service, instanceID string) {
@@ -121,12 +126,14 @@ func (n *Node) deregisterLocalService(service, instanceID string) {
 			Up:          false,
 			Tombstone:   true,
 			LastUpdated: now,
+			ExpiresAt:   now,
 		}
 	} else {
 		cur.Version = nextVer
 		cur.Up = false
 		cur.Tombstone = true
 		cur.LastUpdated = now
+		cur.ExpiresAt = now
 	}
 	n.lastSvcVer[key] = nextVer
 	log.Printf("[SVC] deregistrato %s id=%s ver=%d", service, instanceID, nextVer)
@@ -137,14 +144,26 @@ func (n *Node) pruneExpiredServices() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	for k, s := range n.services {
-		ttl := time.Duration(s.TTLSeconds) * time.Second
-		if ttl == 0 {
-			ttl = 15 * time.Second
+		// normalizza TTL se mancante nel config
+		ttlDur := time.Duration(s.TTLSeconds) * time.Second
+		//Timeout scaduto e tombstone = false, marco il servizio come DOWN
+		if s.Up && !s.Tombstone && now.After(s.ExpiresAt) {
+			// solo il proprietario può aumentarne la versione
+			if s.NodeID == n.cfg.SelfID {
+				base := s.Version
+				if v := n.lastSvcVer[k]; v > base {
+					base = v
+				}
+				s.Version = base + 1
+				n.lastSvcVer[k] = s.Version
+			}
+			s.Up = false
+			log.Printf("[SVC] timeout -> DOWN %s id=%s ver=%d", s.Service, s.InstanceID, s.Version)
 		}
-		// se è passato oltre ttl*2 senza update, elimina
-		if now.Sub(s.LastUpdated) > 2*ttl {
+		//elimina dopo 2*TTL dall’ultimo update
+		if now.Sub(s.LastUpdated) > 2*ttlDur {
 			delete(n.services, k)
-			log.Printf("[SVC] scaduto %s/%s (last=%s)", s.Service, s.InstanceID, s.LastUpdated.Format(time.RFC3339))
+			log.Printf("[SVC] GC %s/%s (last=%s)", s.Service, s.InstanceID, s.LastUpdated.Format(time.RFC3339))
 		}
 	}
 }
@@ -168,33 +187,32 @@ func (n *Node) serviceRefreshLoop() {
 	}
 }
 
-// merge dei servizi ricevuti tramite gossipmessage
 func (n *Node) mergeServices(gm *GossipMessage) int {
 	now := time.Now()
 	updated := 0
 	n.mu.Lock()
 	defer n.mu.Unlock()
+
 	for _, ann := range gm.Services {
 		key := svcKey(ann.Service, ann.InstanceID)
-		cur, ok := n.services[key]
+		cur, _ := n.services[key]
 
-		// scarta se la versione è <= dell'ultima vista (monotono)
 		last := n.lastSvcVer[key]
 		if ann.Version <= last {
 			continue
 		}
-		//se io ho una versione più aggiornata ignora
-		if ok && ann.Version <= cur.Version {
+		if cur != nil && ann.Version <= cur.Version {
 			continue
 		}
+
 		ttl := ann.TTLSeconds
 		if ttl <= 0 {
 			ttl = n.cfg.ServiceTTL
 		}
-
+		ttlDur := time.Duration(ttl) * time.Second
 		up := ann.Up && !ann.Tombstone
-		//aggiorno l entry locale
-		inst := &ServiceInstance{
+
+		n.services[key] = &ServiceInstance{
 			Service:     ann.Service,
 			InstanceID:  ann.InstanceID,
 			NodeID:      ann.NodeID,
@@ -203,9 +221,9 @@ func (n *Node) mergeServices(gm *GossipMessage) int {
 			TTLSeconds:  ttl,
 			Up:          up,
 			Tombstone:   ann.Tombstone,
-			LastUpdated: now,
+			LastUpdated: now,             // <-- arrivo locale
+			ExpiresAt:   now.Add(ttlDur), // <-- scadenza locale
 		}
-		n.services[key] = inst
 		if ann.Version > n.lastSvcVer[key] {
 			n.lastSvcVer[key] = ann.Version
 		}
