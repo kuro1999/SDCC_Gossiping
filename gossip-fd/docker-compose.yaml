@@ -177,6 +177,8 @@ services:
       - CALC_PORT=${NODE7_CALC_PORT}
       - SERVICE_TTL=${SERVICE_TTL}
       - MAX_SERVICE_DIGEST=${MAX_SERVICE_DIGEST}
+      - FANOUT_K=${FANOUT_K}
+      - QUORUM_K=${QUORUM_K}
     ports:
       - "${NODE7_PORT}:${NODE7_PORT}/udp"
       - "${NODE7_PORT}:${NODE7_PORT}/tcp"

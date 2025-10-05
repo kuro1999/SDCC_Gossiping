@@ -532,6 +532,9 @@ func readAB(r *http.Request) (int, int, error) {
 func (n *Node) calculateDynamicFanout() int {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if n.cfg.FanoutK != 0 {
+		return n.cfg.FanoutK
+	}
 	// Calcola il numero di nodi ALIVE
 	aliveCount := 0
 	for _, m := range n.members {

@@ -16,6 +16,7 @@ type NodeConfig struct {
 	SuspectTimeout    time.Duration
 	DeadTimeout       time.Duration
 	MaxDigestPeers    int
+	FanoutK           int
 
 	// Service discovery
 	APIPort          int
@@ -63,6 +64,7 @@ func GetNodeConfig() (NodeConfig, error) {
 		SuspectTimeout:    parseDurationEnv("SUSPECT_TIMEOUT", 2500*time.Millisecond),
 		DeadTimeout:       parseDurationEnv("DEAD_TIMEOUT", 6000*time.Millisecond),
 		MaxDigestPeers:    parseIntEnv("MAX_DIGEST", 64),
+		FanoutK:           parseIntEnv("FANOUT_K", 0),
 
 		APIPort:          apiPort,
 		ServicesCSV:      mustEnv("SERVICES", ""),
