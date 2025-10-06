@@ -32,6 +32,10 @@ services:
       - CALC_PORT=${NODE1_CALC_PORT}
       - SERVICE_TTL=${SERVICE_TTL}
       - MAX_SERVICE_DIGEST=${MAX_SERVICE_DIGEST}
+      - MAX_VOTE_DIGEST=${MAX_VOTE_DIGEST}
+      - MAX_CERT_DIGEST=${MAX_CERT_DIGEST}
+      - FANOUT_K=${FANOUT_K}
+      - QUORUM_K=${QUORUM_K}
     ports:
       - "${NODE1_PORT}:${NODE1_PORT}/udp"
       - "${NODE1_PORT}:${NODE1_PORT}/tcp"
@@ -56,6 +60,10 @@ services:
       - CALC_PORT=${NODE2_CALC_PORT}
       - SERVICE_TTL=${SERVICE_TTL}
       - MAX_SERVICE_DIGEST=${MAX_SERVICE_DIGEST}
+      - MAX_VOTE_DIGEST=${MAX_VOTE_DIGEST}
+      - MAX_CERT_DIGEST=${MAX_CERT_DIGEST}
+      - FANOUT_K=${FANOUT_K}
+      - QUORUM_K=${QUORUM_K}
     ports:
       - "${NODE2_PORT}:${NODE2_PORT}/udp"
       - "${NODE2_PORT}:${NODE2_PORT}/tcp"
@@ -81,6 +89,10 @@ services:
       - CALC_PORT=${NODE3_CALC_PORT}
       - SERVICE_TTL=${SERVICE_TTL}
       - MAX_SERVICE_DIGEST=${MAX_SERVICE_DIGEST}
+      - MAX_VOTE_DIGEST=${MAX_VOTE_DIGEST}
+      - MAX_CERT_DIGEST=${MAX_CERT_DIGEST}
+      - FANOUT_K=${FANOUT_K}
+      - QUORUM_K=${QUORUM_K}
     ports:
       - "${NODE3_PORT}:${NODE3_PORT}/udp"
       - "${NODE3_PORT}:${NODE3_PORT}/tcp"
@@ -105,6 +117,10 @@ services:
       - CALC_PORT=${NODE4_CALC_PORT}
       - SERVICE_TTL=${SERVICE_TTL}
       - MAX_SERVICE_DIGEST=${MAX_SERVICE_DIGEST}
+      - MAX_VOTE_DIGEST=${MAX_VOTE_DIGEST}
+      - MAX_CERT_DIGEST=${MAX_CERT_DIGEST}
+      - FANOUT_K=${FANOUT_K}
+      - QUORUM_K=${QUORUM_K}
     ports:
       - "${NODE4_PORT}:${NODE4_PORT}/udp"
       - "${NODE4_PORT}:${NODE4_PORT}/tcp"
@@ -129,6 +145,10 @@ services:
       - CALC_PORT=${NODE5_CALC_PORT}
       - SERVICE_TTL=${SERVICE_TTL}
       - MAX_SERVICE_DIGEST=${MAX_SERVICE_DIGEST}
+      - MAX_VOTE_DIGEST=${MAX_VOTE_DIGEST}
+      - MAX_CERT_DIGEST=${MAX_CERT_DIGEST}
+      - FANOUT_K=${FANOUT_K}
+      - QUORUM_K=${QUORUM_K}
     ports:
       - "${NODE5_PORT}:${NODE5_PORT}/udp"
       - "${NODE5_PORT}:${NODE5_PORT}/tcp"
@@ -153,6 +173,10 @@ services:
       - CALC_PORT=${NODE6_CALC_PORT}
       - SERVICE_TTL=${SERVICE_TTL}
       - MAX_SERVICE_DIGEST=${MAX_SERVICE_DIGEST}
+      - MAX_VOTE_DIGEST=${MAX_VOTE_DIGEST}
+      - MAX_CERT_DIGEST=${MAX_CERT_DIGEST}
+      - FANOUT_K=${FANOUT_K}
+      - QUORUM_K=${QUORUM_K}
     ports:
       - "${NODE6_PORT}:${NODE6_PORT}/udp"
       - "${NODE6_PORT}:${NODE6_PORT}/tcp"
@@ -177,6 +201,8 @@ services:
       - CALC_PORT=${NODE7_CALC_PORT}
       - SERVICE_TTL=${SERVICE_TTL}
       - MAX_SERVICE_DIGEST=${MAX_SERVICE_DIGEST}
+      - MAX_VOTE_DIGEST=${MAX_VOTE_DIGEST}
+      - MAX_CERT_DIGEST=${MAX_CERT_DIGEST}
       - FANOUT_K=${FANOUT_K}
       - QUORUM_K=${QUORUM_K}
     ports:

@@ -78,7 +78,7 @@ func GetNodeConfig() (NodeConfig, error) {
 		VoteWindow:         parseDurationEnv("VOTE_WINDOW", 6*time.Second),
 		CertTTL:            parseDurationEnv("OBIT_TTL", 18*time.Second),
 		MaxVoteDigest:      parseIntEnv("MAX_VOTE_DIGEST", 16),
-		MaxCertDigest:      parseIntEnv("MAX_OBIT_DIGEST", 8),
+		MaxCertDigest:      parseIntEnv("MAX_CERT_DIGEST", 8),
 		CertPriorityRounds: parseIntEnv("OBIT_PRIORITY_ROUNDS", 3),
 		VotePriorityRounds: parseIntEnv("VOTE_PRIORITY_ROUNDS", 2),
 	}
