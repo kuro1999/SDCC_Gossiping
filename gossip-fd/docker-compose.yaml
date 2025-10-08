@@ -1,14 +1,15 @@
 version: "3.9"
 
 services:
-  # --- Registry (bootstrap only) ---
+  # --- Registry ---
   registry:
     build:
       context: ./registry
       dockerfile: Dockerfile
     container_name: registry
     environment:
-      - registry_port=${REGISTRY_PORT}
+      - REGISTRY_PORT=${REGISTRY_PORT}
+      - REG_FANOUT=${REG_FANOUT}
     ports:
       - "${REGISTRY_PORT}:${REGISTRY_PORT}"
 
@@ -21,14 +22,14 @@ services:
       - registry
     environment:
       - SELF_ID=${NODE1_ID}
-      - SELF_ADDR=${NODE1_HOST}:${NODE1_PORT}
+      - SELF_ADDR=${NODE1_ID}:${NODE1_PORT}
       - REGISTRY_URL=${REGISTRY_HOST}:${REGISTRY_PORT}
       - SEEDS=${SEEDS}
       - GOSSIP_INTERVAL=${GOSSIP_INTERVAL}
       - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL}
       - SUSPECT_TIMEOUT=${SUSPECT_TIMEOUT}
       - DEAD_TIMEOUT=${DEAD_TIMEOUT}
-      - SERVICES=${SERVICES_DEFAULT}
+      - SERVICES=
       - CALC_PORT=${NODE1_CALC_PORT}
       - SERVICE_TTL=${SERVICE_TTL}
       - MAX_SERVICE_DIGEST=${MAX_SERVICE_DIGEST}
@@ -36,6 +37,11 @@ services:
       - MAX_CERT_DIGEST=${MAX_CERT_DIGEST}
       - FANOUT_K=${FANOUT_K}
       - QUORUM_K=${QUORUM_K}
+      - CERT_TTL=${CERT_TTL}
+      - VOTE_WINDOW=${VOTE_WINDOW}
+      - MAX_DIGEST_PEERS=${MAX_DIGEST_PEERS}
+      - CERT_PRIORITY_ROUNDS=${CERT_PRIORITY_ROUNDS}
+      - VOTE_PRIORITY_ROUNDS=${VOTE_PRIORITY_ROUNDS}
     ports:
       - "${NODE1_PORT}:${NODE1_PORT}/udp"
       - "${NODE1_PORT}:${NODE1_PORT}/tcp"
@@ -49,14 +55,14 @@ services:
     depends_on: [registry]
     environment:
       - SELF_ID=${NODE2_ID}
-      - SELF_ADDR=${NODE2_HOST}:${NODE2_PORT}
+      - SELF_ADDR=${NODE2_ID}:${NODE2_PORT}
       - REGISTRY_URL=${REGISTRY_HOST}:${REGISTRY_PORT}
       - SEEDS=${SEEDS}
       - GOSSIP_INTERVAL=${GOSSIP_INTERVAL}
       - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL}
       - SUSPECT_TIMEOUT=${SUSPECT_TIMEOUT}
       - DEAD_TIMEOUT=${DEAD_TIMEOUT}
-      - SERVICES=${SERVICES_DEFAULT}
+      - SERVICES=
       - CALC_PORT=${NODE2_CALC_PORT}
       - SERVICE_TTL=${SERVICE_TTL}
       - MAX_SERVICE_DIGEST=${MAX_SERVICE_DIGEST}
@@ -64,6 +70,11 @@ services:
       - MAX_CERT_DIGEST=${MAX_CERT_DIGEST}
       - FANOUT_K=${FANOUT_K}
       - QUORUM_K=${QUORUM_K}
+      - CERT_TTL=${CERT_TTL}
+      - VOTE_WINDOW=${VOTE_WINDOW}
+      - MAX_DIGEST_PEERS=${MAX_DIGEST_PEERS}
+      - CERT_PRIORITY_ROUNDS=${CERT_PRIORITY_ROUNDS}
+      - VOTE_PRIORITY_ROUNDS=${VOTE_PRIORITY_ROUNDS}
     ports:
       - "${NODE2_PORT}:${NODE2_PORT}/udp"
       - "${NODE2_PORT}:${NODE2_PORT}/tcp"
@@ -77,9 +88,8 @@ services:
     depends_on: [registry]
     environment:
       - SELF_ID=${NODE3_ID}
-      - SELF_ADDR=${NODE3_HOST}:${NODE3_PORT}
+      - SELF_ADDR=${NODE3_ID}:${NODE3_PORT}
       - REGISTRY_URL=${REGISTRY_HOST}:${REGISTRY_PORT}
-      - REGISTRY_JOIN_TIMEOUT=${NODE3_REGISTRY_JOIN_TIMEOUT}
       - SEEDS=${SEEDS}
       - GOSSIP_INTERVAL=${GOSSIP_INTERVAL}
       - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL}
@@ -93,6 +103,11 @@ services:
       - MAX_CERT_DIGEST=${MAX_CERT_DIGEST}
       - FANOUT_K=${FANOUT_K}
       - QUORUM_K=${QUORUM_K}
+      - CERT_TTL=${CERT_TTL}
+      - VOTE_WINDOW=${VOTE_WINDOW}
+      - MAX_DIGEST_PEERS=${MAX_DIGEST_PEERS}
+      - CERT_PRIORITY_ROUNDS=${CERT_PRIORITY_ROUNDS}
+      - VOTE_PRIORITY_ROUNDS=${VOTE_PRIORITY_ROUNDS}
     ports:
       - "${NODE3_PORT}:${NODE3_PORT}/udp"
       - "${NODE3_PORT}:${NODE3_PORT}/tcp"
@@ -106,14 +121,14 @@ services:
     depends_on: [registry]
     environment:
       - SELF_ID=${NODE4_ID}
-      - SELF_ADDR=${NODE4_HOST}:${NODE4_PORT}
+      - SELF_ADDR=${NODE4_ID}:${NODE4_PORT}
       - REGISTRY_URL=${REGISTRY_HOST}:${REGISTRY_PORT}
       - SEEDS=${SEEDS}
       - GOSSIP_INTERVAL=${GOSSIP_INTERVAL}
       - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL}
       - SUSPECT_TIMEOUT=${SUSPECT_TIMEOUT}
       - DEAD_TIMEOUT=${DEAD_TIMEOUT}
-      - SERVICES=${SERVICES_DEFAULT}
+      - SERVICES=
       - CALC_PORT=${NODE4_CALC_PORT}
       - SERVICE_TTL=${SERVICE_TTL}
       - MAX_SERVICE_DIGEST=${MAX_SERVICE_DIGEST}
@@ -121,6 +136,11 @@ services:
       - MAX_CERT_DIGEST=${MAX_CERT_DIGEST}
       - FANOUT_K=${FANOUT_K}
       - QUORUM_K=${QUORUM_K}
+      - CERT_TTL=${CERT_TTL}
+      - VOTE_WINDOW=${VOTE_WINDOW}
+      - MAX_DIGEST_PEERS=${MAX_DIGEST_PEERS}
+      - CERT_PRIORITY_ROUNDS=${CERT_PRIORITY_ROUNDS}
+      - VOTE_PRIORITY_ROUNDS=${VOTE_PRIORITY_ROUNDS}
     ports:
       - "${NODE4_PORT}:${NODE4_PORT}/udp"
       - "${NODE4_PORT}:${NODE4_PORT}/tcp"
@@ -134,14 +154,14 @@ services:
     depends_on: [registry]
     environment:
       - SELF_ID=${NODE5_ID}
-      - SELF_ADDR=${NODE5_HOST}:${NODE5_PORT}
+      - SELF_ADDR=${NODE5_ID}:${NODE5_PORT}
       - REGISTRY_URL=${REGISTRY_HOST}:${REGISTRY_PORT}
       - SEEDS=${SEEDS}
       - GOSSIP_INTERVAL=${GOSSIP_INTERVAL}
       - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL}
       - SUSPECT_TIMEOUT=${SUSPECT_TIMEOUT}
       - DEAD_TIMEOUT=${DEAD_TIMEOUT}
-      - SERVICES=${SERVICES_DEFAULT}
+      - SERVICES=
       - CALC_PORT=${NODE5_CALC_PORT}
       - SERVICE_TTL=${SERVICE_TTL}
       - MAX_SERVICE_DIGEST=${MAX_SERVICE_DIGEST}
@@ -149,6 +169,11 @@ services:
       - MAX_CERT_DIGEST=${MAX_CERT_DIGEST}
       - FANOUT_K=${FANOUT_K}
       - QUORUM_K=${QUORUM_K}
+      - CERT_TTL=${CERT_TTL}
+      - VOTE_WINDOW=${VOTE_WINDOW}
+      - MAX_DIGEST_PEERS=${MAX_DIGEST_PEERS}
+      - CERT_PRIORITY_ROUNDS=${CERT_PRIORITY_ROUNDS}
+      - VOTE_PRIORITY_ROUNDS=${VOTE_PRIORITY_ROUNDS}
     ports:
       - "${NODE5_PORT}:${NODE5_PORT}/udp"
       - "${NODE5_PORT}:${NODE5_PORT}/tcp"
@@ -162,14 +187,14 @@ services:
     depends_on: [registry]
     environment:
       - SELF_ID=${NODE6_ID}
-      - SELF_ADDR=${NODE6_HOST}:${NODE6_PORT}
+      - SELF_ADDR=${NODE6_ID}:${NODE6_PORT}
       - REGISTRY_URL=${REGISTRY_HOST}:${REGISTRY_PORT}
       - SEEDS=${SEEDS}
       - GOSSIP_INTERVAL=${GOSSIP_INTERVAL}
       - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL}
       - SUSPECT_TIMEOUT=${SUSPECT_TIMEOUT}
       - DEAD_TIMEOUT=${DEAD_TIMEOUT}
-      - SERVICES=${SERVICES_DEFAULT}
+      - SERVICES=
       - CALC_PORT=${NODE6_CALC_PORT}
       - SERVICE_TTL=${SERVICE_TTL}
       - MAX_SERVICE_DIGEST=${MAX_SERVICE_DIGEST}
@@ -177,6 +202,11 @@ services:
       - MAX_CERT_DIGEST=${MAX_CERT_DIGEST}
       - FANOUT_K=${FANOUT_K}
       - QUORUM_K=${QUORUM_K}
+      - CERT_TTL=${CERT_TTL}
+      - VOTE_WINDOW=${VOTE_WINDOW}
+      - MAX_DIGEST_PEERS=${MAX_DIGEST_PEERS}
+      - CERT_PRIORITY_ROUNDS=${CERT_PRIORITY_ROUNDS}
+      - VOTE_PRIORITY_ROUNDS=${VOTE_PRIORITY_ROUNDS}
     ports:
       - "${NODE6_PORT}:${NODE6_PORT}/udp"
       - "${NODE6_PORT}:${NODE6_PORT}/tcp"
@@ -190,14 +220,14 @@ services:
     depends_on: [registry]
     environment:
       - SELF_ID=${NODE7_ID}
-      - SELF_ADDR=${NODE7_HOST}:${NODE7_PORT}
+      - SELF_ADDR=${NODE7_ID}:${NODE7_PORT}
       - REGISTRY_URL=${REGISTRY_HOST}:${REGISTRY_PORT}
       - SEEDS=${SEEDS}
       - GOSSIP_INTERVAL=${GOSSIP_INTERVAL}
       - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL}
       - SUSPECT_TIMEOUT=${SUSPECT_TIMEOUT}
       - DEAD_TIMEOUT=${DEAD_TIMEOUT}
-      - SERVICES=${SERVICES_DEFAULT}
+      - SERVICES=
       - CALC_PORT=${NODE7_CALC_PORT}
       - SERVICE_TTL=${SERVICE_TTL}
       - MAX_SERVICE_DIGEST=${MAX_SERVICE_DIGEST}
@@ -205,6 +235,11 @@ services:
       - MAX_CERT_DIGEST=${MAX_CERT_DIGEST}
       - FANOUT_K=${FANOUT_K}
       - QUORUM_K=${QUORUM_K}
+      - CERT_TTL=${CERT_TTL}
+      - VOTE_WINDOW=${VOTE_WINDOW}
+      - MAX_DIGEST_PEERS=${MAX_DIGEST_PEERS}
+      - CERT_PRIORITY_ROUNDS=${CERT_PRIORITY_ROUNDS}
+      - VOTE_PRIORITY_ROUNDS=${VOTE_PRIORITY_ROUNDS}
     ports:
       - "${NODE7_PORT}:${NODE7_PORT}/udp"
       - "${NODE7_PORT}:${NODE7_PORT}/tcp"
@@ -219,10 +254,6 @@ services:
       - node1
       - node2
       - node3
-      - node4
-      - node5
-      - node6
-      - node7
     restart: unless-stopped
 
 networks:

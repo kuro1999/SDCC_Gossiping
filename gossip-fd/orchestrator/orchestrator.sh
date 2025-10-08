@@ -3,35 +3,43 @@
 # =======================
 # Parametri configurabili
 # =======================
-
-# Durata della pausa tra gli step
-PAUSE_SECS=2
+PAUSE_SECS=3
 
 echo "===== [BOOTSTRAP] Avvio sequenza test ====="
 sleep $PAUSE_SECS
 
-# Messaggio di bootstrap
 echo "[BOOTSTRAP] Inizio bootstrap della rete..."
 sleep $PAUSE_SECS
 
-# Chiamata al servizio 'sum' su node1
-echo "[STEP] Chiamo servizio SUM su node1..."
-ADDR="$(curl -sS "http://node1:9000/discover?service=calc" | jq -r '.[0].addr // empty' || true)"
-if [ -n "${ADDR}" ]; then
-  URL="http://${ADDR}/sum?a=5&b=5"
-  echo "$(date -Iseconds) [CALL] ${URL}"
-  RESP="$(curl -sS "${URL}" || true)"
-  echo "$(date -Iseconds) [CALL][DONE] result=${RESP}"
+# --- Sonda: servizi locali PRIMA della registrazione ---
+echo "[STEP] Servizi locali su node1 (PRIMA della registrazione)..."
+URL_SL_PRIMA="http://node1:9000/services/local"
+echo "$(date -Iseconds) [GET] ${URL_SL_PRIMA}"
+RESP="$(curl -sS "${URL_SL_PRIMA}" || true)"
+if [ -n "${RESP}" ]; then
+  echo "${RESP}" | jq .
 else
-  echo "$(date -Iseconds) [DISCOVER][WARN] nessun indirizzo trovato"
+  echo "$(date -Iseconds) [WARN] nessuna risposta da /services/local"
 fi
 sleep $PAUSE_SECS
 
-# Registrazione del servizio 'calc' su node1
-echo "[STEP] Registro servizio SUB su node1..."
+# --- Sonda: discover PRIMA della registrazione ---
+echo "[STEP] Discover calc (PRIMA della registrazione)..."
+URL_DISC_PRIMA="http://node1:9000/discover?service=calc"
+echo "$(date -Iseconds) [GET] ${URL_DISC_PRIMA}"
+RESP="$(curl -sS "${URL_DISC_PRIMA}" || true)"
+if [ -n "${RESP}" ]; then
+  echo "${RESP}" | jq .
+else
+  echo "$(date -Iseconds) [WARN] nessuna risposta da /discover"
+fi
+sleep $PAUSE_SECS
+
+
+echo "[STEP] Registro servizio CALC su node1..."
 REG_CODE="$(curl -sS -o /dev/null -w "%{http_code}" -X POST "http://node1:9000/service/register" \
   -H 'Content-Type: application/json' \
-  -d "{\"service\":\"calc\",\"instance_id\":\"dyn-node1\",\"addr\":\"node1:18080\",\"ttl\":15}")"
+  -d "{\"service\":\"calc\",\"instance_id\":\"dyn-node1\",\"addr\":\"node1:18080\"}")"
 if [ "${REG_CODE}" = "200" ]; then
   echo "$(date -Iseconds) [REGISTER][OK] http=${REG_CODE}"
 else
@@ -39,9 +47,31 @@ else
 fi
 sleep $PAUSE_SECS
 
+# --- Sonda: servizi locali DOPO la registrazione ---
+echo "[STEP] Servizi locali su node1 (DOPO la registrazione)..."
+URL_SL_DOPO_REG="http://node1:9000/services/local"
+echo "$(date -Iseconds) [GET] ${URL_SL_DOPO_REG}"
+RESP="$(curl -sS "${URL_SL_DOPO_REG}" || true)"
+if [ -n "${RESP}" ]; then
+  echo "${RESP}" | jq .
+else
+  echo "$(date -Iseconds) [WARN] nessuna risposta da /services/local"
+fi
+sleep $PAUSE_SECS
 
-# Chiamata al servizio 'sum' su node1
-echo "[STEP] Chiamo servizio SUM su node1..."
+# --- Sonda: discover DOPO la registrazione ---
+echo "[STEP] Discover calc (DOPO la registrazione)..."
+URL_DISC_DOPO_REG="http://node1:9000/discover?service=calc"
+echo "$(date -Iseconds) [GET] ${URL_DISC_DOPO_REG}"
+RESP="$(curl -sS "${URL_DISC_DOPO_REG}" || true)"
+if [ -n "${RESP}" ]; then
+  echo "${RESP}" | jq .
+else
+  echo "$(date -Iseconds) [WARN] nessuna risposta da /discover"
+fi
+sleep $PAUSE_SECS
+
+echo "[STEP] Chiamo SUM su node1..."
 ADDR="$(curl -sS "http://node1:9000/discover?service=calc" | jq -r '.[0].addr // empty' || true)"
 if [ -n "${ADDR}" ]; then
   URL="http://${ADDR}/sum?a=5&b=5"
@@ -53,8 +83,7 @@ else
 fi
 sleep $PAUSE_SECS
 
-# Chiamata al servizio 'sub'
-echo "[STEP] Chiamo servizio SUB su node1..."
+echo "[STEP] Chiamo SUB su node1..."
 ADDR="$(curl -sS "http://node1:9000/discover?service=calc" | jq -r '.[0].addr // empty' || true)"
 if [ -n "${ADDR}" ]; then
   URL="http://${ADDR}/sub?a=5&b=4"
@@ -66,8 +95,7 @@ else
 fi
 sleep $PAUSE_SECS
 
-# Deregistra il servizio 'calc'
-echo "[STEP] Deregistro servizio SUB..."
+echo "[STEP] Deregistro servizio CALC..."
 DEREG_CODE="$(curl -sS -o /dev/null -w "%{http_code}" -X POST "http://node1:9000/service/deregister" \
   -H 'Content-Type: application/json' \
   -d "{\"service\":\"calc\",\"instance_id\":\"dyn-node1\",\"addr\":\"node1:18080\"}")"
@@ -78,9 +106,31 @@ else
 fi
 sleep $PAUSE_SECS
 
+# --- Sonda: servizi locali DOPO la deregistrazione ---
+echo "[STEP] Servizi locali su node1 (DOPO la deregistrazione)..."
+URL_SL_DOPO_DEREG="http://node1:9000/services/local"
+echo "$(date -Iseconds) [GET] ${URL_SL_DOPO_DEREG}"
+RESP="$(curl -sS "${URL_SL_DOPO_DEREG}" || true)"
+if [ -n "${RESP}" ]; then
+  echo "${RESP}" | jq .
+else
+  echo "$(date -Iseconds) [WARN] nessuna risposta da /services/local"
+fi
+sleep $PAUSE_SECS
 
-# Chiamata al servizio 'sum' su node1
-echo "[STEP] Chiamo servizio SUM su node1..."
+# --- Sonda: discover DOPO la deregistrazione ---
+echo "[STEP] Discover calc (DOPO la deregistrazione)..."
+URL_DISC_DOPO_DEREG="http://node1:9000/discover?service=calc"
+echo "$(date -Iseconds) [GET] ${URL_DISC_DOPO_DEREG}"
+RESP="$(curl -sS "${URL_DISC_DOPO_DEREG}" || true)"
+if [ -n "${RESP}" ]; then
+  echo "${RESP}" | jq .
+else
+  echo "$(date -Iseconds) [WARN] nessuna risposta da /discover"
+fi
+sleep $PAUSE_SECS
+
+echo "[STEP] Chiamo SUM su node1..."
 ADDR="$(curl -sS "http://node1:9000/discover?service=calc" | jq -r '.[0].addr // empty' || true)"
 if [ -n "${ADDR}" ]; then
   URL="http://${ADDR}/sum?a=5&b=5"

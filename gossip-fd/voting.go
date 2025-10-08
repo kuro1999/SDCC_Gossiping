@@ -166,15 +166,16 @@ func (n *Node) ingestVotes(votes []DeathVote) (promoted int) {
 		// aggiorna finestra e lista witness
 		b.ExpiresAt = now.Add(n.cfg.VoteWindow)
 		b.Witness[v.Witness] = v.Ts
-		log.Printf("[VOTE] witness=%s per %s (|W|=%d/%d)", v.Witness, v.Target, len(b.Witness), n.cfg.QuorumK)
+		quorum := n.cfg.QuorumK
+		log.Printf("[VOTE] witness=%s per %s (|W|=%d/%d)", v.Witness, v.Target, len(b.Witness), quorum)
 		if b.Priority < n.cfg.VotePriorityRounds {
 			b.Priority = n.cfg.VotePriorityRounds
 		}
 
 		// quorum raggiunto?
-		if len(b.Witness) >= n.cfg.QuorumK {
+		if len(b.Witness) >= quorum {
 			log.Printf("[EMISSION] quorum raggiunto per %s (K=%d, inc=%d hb=%d) → certificato emesso (TTL=%s)",
-				v.Target, n.cfg.QuorumK, b.Evidence.Inc, b.Evidence.Hb, n.cfg.CertTTL)
+				v.Target, quorum, b.Evidence.Inc, b.Evidence.Hb, n.cfg.CertTTL)
 			// promuovi a certificato di mort
 			if _, exists := n.DeathCertificates[v.Target]; !exists {
 				iat := now
@@ -218,6 +219,7 @@ func (n *Node) selectCertsLocked(max int) []DeathCertificate {
 	if len(list) > max {
 		list = list[:max]
 	}
+	quorum := n.cfg.QuorumK
 	out := make([]DeathCertificate, 0, len(list))
 	for _, r := range list {
 		out = append(out, DeathCertificate{
@@ -226,7 +228,7 @@ func (n *Node) selectCertsLocked(max int) []DeathCertificate {
 			Hb:       r.Evidence.Hb,
 			IssuedAt: r.IssuedAt,
 			TtlSec:   int(n.cfg.CertTTL.Seconds()),
-			Quorum:   n.cfg.QuorumK,
+			Quorum:   quorum,
 		})
 		// consuma un round di priorità
 		if r.Priority > 0 {

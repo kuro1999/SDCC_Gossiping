@@ -9,7 +9,6 @@ type svcRegisterReq struct {
 	Service    string `json:"service"`
 	InstanceID string `json:"instance_id"`
 	Addr       string `json:"addr"`
-	TTL        int    `json:"ttl_seconds"`
 }
 
 type svcDeregisterReq struct {
@@ -18,14 +17,14 @@ type svcDeregisterReq struct {
 }
 
 type ServiceAnnouncement struct {
-	Service    string `json:"service"` // "calc"
-	InstanceID string `json:"id"`      // "node1-calc"
-	NodeID     string `json:"node"`    // chi ospita il servizio
-	Addr       string `json:"addr"`    // "node1:18080"
-	Version    uint64 `json:"ver"`     // contatore monotono
-	TTLSeconds int    `json:"ttl"`     // configurabile da env
-	Up         bool   `json:"up"`      // true se attivo
-	Tombstone  bool   `json:"tomb"`    // segnala sevizio inattivo
+	Service    string        `json:"service"` // "calc"
+	InstanceID string        `json:"id"`      // "node1-calc"
+	NodeID     string        `json:"node"`    // chi ospita il servizio
+	Addr       string        `json:"addr"`    // "node1:18080"
+	Version    uint64        `json:"ver"`     // contatore monotono
+	TTLSeconds time.Duration `json:"ttl"`     // configurabile da env
+	Up         bool          `json:"up"`      // true se attivo
+	Tombstone  bool          `json:"tomb"`    // segnala sevizio inattivo
 }
 
 type ServiceInstance struct {
@@ -34,14 +33,14 @@ type ServiceInstance struct {
 	NodeID      string
 	Addr        string
 	Version     uint64
-	TTLSeconds  int
+	TTLSeconds  time.Duration
 	Up          bool
 	LastUpdated time.Time
 	ExpiresAt   time.Time
 	Tombstone   bool
 }
 
-func (n *Node) registerLocalService(service, instanceID, addr string, ttl int) {
+func (n *Node) registerLocalService(service, instanceID, addr string, ttl time.Duration) {
 	now := time.Now()
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -56,7 +55,6 @@ func (n *Node) registerLocalService(service, instanceID, addr string, ttl int) {
 		base = v
 	}
 	nextVer := base + 1
-	ttlDur := time.Duration(ttl) * time.Second
 
 	if !ok {
 		// nuova entry locale
@@ -66,11 +64,10 @@ func (n *Node) registerLocalService(service, instanceID, addr string, ttl int) {
 			NodeID:      n.cfg.SelfID,
 			Addr:        addr,
 			Version:     nextVer,
-			TTLSeconds:  ttl,
 			Up:          true,
 			Tombstone:   false,
-			LastUpdated: now,             // solo per metriche/log
-			ExpiresAt:   now.Add(ttlDur), // vero deadline locale
+			LastUpdated: now,          // solo per metriche/log
+			ExpiresAt:   now.Add(ttl), // vero deadline locale
 		}
 		n.services[key] = cur
 		n.lastSvcVer[key] = nextVer
@@ -86,7 +83,7 @@ func (n *Node) registerLocalService(service, instanceID, addr string, ttl int) {
 	cur.Tombstone = false
 	cur.LastUpdated = now
 	cur.TTLSeconds = ttl
-	cur.ExpiresAt = now.Add(ttlDur) // estensione della deadline locale
+	cur.ExpiresAt = now.Add(ttl) // estensione della deadline locale
 
 	if addr != "" && addr != cur.Addr {
 		cur.Addr = addr
@@ -205,11 +202,6 @@ func (n *Node) mergeServices(gm *GossipMessage) int {
 			continue
 		}
 
-		ttl := ann.TTLSeconds
-		if ttl <= 0 {
-			ttl = n.cfg.ServiceTTL
-		}
-		ttlDur := time.Duration(ttl) * time.Second
 		up := ann.Up && !ann.Tombstone
 
 		n.services[key] = &ServiceInstance{
@@ -218,11 +210,11 @@ func (n *Node) mergeServices(gm *GossipMessage) int {
 			NodeID:      ann.NodeID,
 			Addr:        ann.Addr,
 			Version:     ann.Version,
-			TTLSeconds:  ttl,
+			TTLSeconds:  ann.TTLSeconds,
 			Up:          up,
 			Tombstone:   ann.Tombstone,
-			LastUpdated: now,             // <-- arrivo locale
-			ExpiresAt:   now.Add(ttlDur), // <-- scadenza locale
+			LastUpdated: now,                     // <-- arrivo locale
+			ExpiresAt:   now.Add(ann.TTLSeconds), // <-- scadenza locale
 		}
 		if ann.Version > n.lastSvcVer[key] {
 			n.lastSvcVer[key] = ann.Version

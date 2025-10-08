@@ -15,9 +15,10 @@ import (
 )
 
 type Registry struct {
-	mu    sync.Mutex
-	nodes map[string]*regEntry
-	port  int
+	mu         sync.Mutex
+	nodes      map[string]*regEntry
+	port       int
+	reg_fanout int
 }
 
 type regEntry struct {
@@ -62,7 +63,14 @@ func (r *Registry) startRegistry(port int) {
 		if N == 0 {
 			log.Printf("no peers found, giving an empty list to node: %s", in.ID)
 		} else {
-			k = int(math.Log2(float64(N))) + 1
+			if r.reg_fanout == 0 {
+				k = int(math.Log2(float64(N))) + 1
+			} else {
+				k = r.reg_fanout
+			}
+			if k > N {
+				k = N
+			}
 			rand.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
 			if len(peers) >= k {
 				peers = peers[:k]
@@ -105,8 +113,9 @@ func parseIntEnv(key string, def int) int {
 }
 func main() {
 	reg := &Registry{
-		nodes: make(map[string]*regEntry),
-		port:  parseIntEnv("PORT", 8089),
+		nodes:      make(map[string]*regEntry),
+		port:       parseIntEnv("REGISTRY_PORT", 8089),
+		reg_fanout: parseIntEnv("REG_FANOUT", 0), //se 0 allora dinamico else preso da config
 	}
 	reg.startRegistry(reg.port)
 

@@ -107,13 +107,15 @@ func NewNode() (*Node, error) {
 
 func (n *Node) run() {
 	log.Printf("[BOOT] %s su %s | API :%d | services=%q | registry=%s",
-		n.cfg.SelfID, n.cfg.SelfAddr, n.cfg.APIPort, n.cfg.ServicesCSV, n.cfg.RegistryURL)
+		n.cfg.SelfID, n.cfg.SelfAddr, n.cfg.APIPort, n.cfg.Services, n.cfg.RegistryURL)
 	// stringa host del nodo senza la porta
 	selfHost, _, _ := strings.Cut(n.cfg.SelfAddr, ":")
 	// recupero lista peer dal registry
 	if peers, err := n.bootstrapFromRegistry(); err != nil {
+
 		log.Printf("[ERROR] Errore nel bootstrap dal registry: %v", err)
 	} else {
+		log.Printf("[END-BOOT] peers received: %v", peers)
 		for _, p := range peers {
 			// p è un addr HTTP "host:porta" restituito dal registry
 			host, _, _ := strings.Cut(p, ":")
@@ -133,6 +135,7 @@ func (n *Node) run() {
 				}
 			} else { //se assente nella membership
 				// nuovo peer in vista iniziale
+				log.Printf("[MACCHECCAZZONESOIO] node:port %s", p)
 				n.members[host] = &Member{
 					ID:        host, // ID canonico = solo host
 					Addr:      p,    // indirizzo completo host:porta per UDP/HTTP
@@ -156,7 +159,7 @@ func (n *Node) run() {
 	n.maybeStartDemoServices()
 
 	go n.serviceRefreshLoop()
-
+	log.Printf("[BOOT] AVVIATE TUTTE LE ROUTINE")
 	//Stampa periodicamente la view della membership
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
@@ -219,6 +222,7 @@ func (n *Node) receiveLoop() {
 			log.Printf("[RECV-ERR] %v", err)
 			continue
 		}
+		log.Printf("MAAAAAAAAA IO STO A RICEVE QUALCOSAAAAAAAAAAAAA!!!!!!!!! BOH")
 		data := make([]byte, nRead)
 		copy(data, buf[:nRead])
 
@@ -309,15 +313,12 @@ func (n *Node) startDiscoveryAPI(port int) {
 			http.Error(w, "missing fields: service, instance_id, addr", http.StatusBadRequest)
 			return
 		}
-		if req.TTL <= 0 {
-			req.TTL = n.cfg.ServiceTTL
-		}
 		//registro effettivamente il servizio
-		n.registerLocalService(req.Service, req.InstanceID, req.Addr, req.TTL)
+		n.registerLocalService(req.Service, req.InstanceID, req.Addr, n.cfg.ServiceTTL)
 		// se mi registrano "calc" su questo nodo, accendo l'HTTP service calc
 		if req.Service == "calc" && !n.calcStarted {
 			n.calcStarted = true
-			go startCalcService(n, port, false) // false: niente auto-register
+			go startCalcService(n, n.cfg.CalcPort, false) // false: niente auto-register
 			log.Printf("[SVC] avviato calc su :%d in seguito a /service/register", port)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -354,13 +355,13 @@ func (n *Node) startDiscoveryAPI(port int) {
 	//rispondo con i servizi attivi localmente sul nodo
 	mux.HandleFunc("/services/local", func(w http.ResponseWriter, r *http.Request) {
 		type out struct {
-			Service    string `json:"service"`
-			InstanceID string `json:"id"`
-			Addr       string `json:"addr"`
-			Version    uint64 `json:"ver"`
-			TTL        int    `json:"ttl"`
-			Up         bool   `json:"up"`
-			AgeSec     int64  `json:"age_sec"`
+			Service    string        `json:"service"`
+			InstanceID string        `json:"id"`
+			Addr       string        `json:"addr"`
+			Version    uint64        `json:"ver"`
+			TTL        time.Duration `json:"ttl"`
+			Up         bool          `json:"up"`
+			AgeSec     int64         `json:"age_sec"`
 		}
 		now := time.Now()
 		resp := []out{}
@@ -404,7 +405,7 @@ func (n *Node) startDiscoveryAPI(port int) {
 				continue
 			}
 			// scarta i servizi che hanno superato il ttl
-			if now.Sub(s.LastUpdated) > time.Duration(s.TTLSeconds)*time.Second {
+			if now.Sub(s.LastUpdated) > s.TTLSeconds {
 				continue
 			}
 			// il nodo che ospita il servizio deve essere Alive
@@ -418,7 +419,18 @@ func (n *Node) startDiscoveryAPI(port int) {
 		}
 		n.mu.Unlock()
 
-		sort.Slice(out, func(i, j int) bool { return out[i].InstanceID < out[j].InstanceID })
+		sort.Slice(out, func(i, j int) bool {
+			// prima il locale se presente
+			if out[i].Node == n.cfg.SelfID && out[j].Node != n.cfg.SelfID {
+				return true
+			}
+			if out[i].Node != n.cfg.SelfID && out[j].Node == n.cfg.SelfID {
+				return false
+			}
+			// poi per InstanceID
+			return out[i].InstanceID < out[j].InstanceID
+		})
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(out)
 	})
@@ -435,7 +447,7 @@ func (n *Node) startDiscoveryAPI(port int) {
 }
 
 func (n *Node) maybeStartDemoServices() {
-	services := strings.Split(strings.TrimSpace(n.cfg.ServicesCSV), ",")
+	services := strings.Split(strings.TrimSpace(n.cfg.Services), ",")
 	for _, s := range services {
 		s = strings.TrimSpace(s)
 		switch s {
@@ -502,13 +514,14 @@ func startCalcService(n *Node, port int, autoRegister bool) {
 	}
 
 	srv := &http.Server{
-		Addr:              fmt.Sprintf(":%d", port),
-		Handler:           mux,
-		ReadHeaderTimeout: 3 * time.Second,
+		Addr:    fmt.Sprintf(":%d", port),
+		Handler: mux,
+		//ReadHeaderTimeout: 3 * time.Second,
 	}
 	log.Printf("[HTTP] calc service su :%d (%s)", port, addr)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("[HTTP] calc errore: %v", err)
+		return
 	}
 }
 
@@ -532,9 +545,7 @@ func readAB(r *http.Request) (int, int, error) {
 func (n *Node) calculateDynamicFanout() int {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.cfg.FanoutK != 0 {
-		return n.cfg.FanoutK
-	}
+
 	// Calcola il numero di nodi ALIVE
 	aliveCount := 0
 	for _, m := range n.members {
@@ -545,8 +556,15 @@ func (n *Node) calculateDynamicFanout() int {
 	if aliveCount <= 1 {
 		return 1 // se c'è un solo nodo, fanout è 1
 	}
+	fanout := n.cfg.FanoutK
+	if fanout != 0 {
+		if fanout > aliveCount {
+			fanout = aliveCount
+		}
+		return fanout
+	}
 	// Calcolo del fanout con log2
-	fanout := int(math.Log2(float64(aliveCount))) + 1
+	fanout = int(math.Log2(float64(aliveCount))) + 1
 	return fanout
 }
 
@@ -555,6 +573,7 @@ func (n *Node) pickRandomTargets(k int) []*Member {
 	defer n.mu.Unlock()
 	// Crea una lista di nodi ALIVE e SUSPECT
 	peers := make([]*Member, 0, len(n.members))
+	log.Printf("[MEMBERSHIP] attuale membership prima di capire a chi mandare %v", n.members)
 	for id, m := range n.members {
 		if id == n.cfg.SelfID {
 			continue
@@ -565,14 +584,17 @@ func (n *Node) pickRandomTargets(k int) []*Member {
 	}
 	// Se non ci sono peer disponibili, ritorna nil
 	if len(peers) == 0 {
+		log.Printf("[COSTRUENDO PEERS]: no targets picked")
 		return nil
 	}
 	// Se il numero di peer è inferiore al fanoutK, ritorna tutti i peer
 	if len(peers) <= k {
+		log.Printf("[COSTRUENDO PEERS]: target picked %v", peers)
 		return peers
 	}
 	// Ritorna solo i primi 'k' peer
 	rand.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
+	log.Printf("[COSTRUENDO PEERS]: target picked %v", peers)
 	return peers[:k]
 }
 
@@ -635,7 +657,7 @@ func (n *Node) printView() {
 					ttl = 15
 				}
 				age := now.Sub(s.LastUpdated).Truncate(time.Millisecond)
-				expired := age > time.Duration(ttl)*time.Second
+				expired := age > ttl
 				status := "down"
 				switch {
 				case s.Tombstone:

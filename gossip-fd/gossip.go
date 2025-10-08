@@ -140,6 +140,7 @@ func (n *Node) sendGossip() {
 	//Scelta target
 	targets := n.pickRandomTargets(fanoutK)
 	if len(targets) == 0 {
+		log.Printf("[STATE] no targets picked")
 		return
 	}
 	//costruisco il  messaggio

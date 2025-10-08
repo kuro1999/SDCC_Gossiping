@@ -20,9 +20,9 @@ type NodeConfig struct {
 
 	// Service discovery
 	APIPort          int
-	ServicesCSV      string
+	Services         string
 	CalcPort         int
-	ServiceTTL       int
+	ServiceTTL       time.Duration
 	MaxServiceDigest int
 
 	// Registry
@@ -63,23 +63,23 @@ func GetNodeConfig() (NodeConfig, error) {
 		HeartbeatInterval: parseDurationEnv("HEARTBEAT_INTERVAL", 500*time.Millisecond),
 		SuspectTimeout:    parseDurationEnv("SUSPECT_TIMEOUT", 2500*time.Millisecond),
 		DeadTimeout:       parseDurationEnv("DEAD_TIMEOUT", 6000*time.Millisecond),
-		MaxDigestPeers:    parseIntEnv("MAX_DIGEST", 64),
+		MaxDigestPeers:    parseIntEnv("MAX_DIGEST_PEERS", 64),
 		FanoutK:           parseIntEnv("FANOUT_K", 0),
 
 		APIPort:          apiPort,
-		ServicesCSV:      mustEnv("SERVICES", ""),
+		Services:         mustEnv("SERVICES", ""),
 		CalcPort:         parseIntEnv("CALC_PORT", 18080),
-		ServiceTTL:       parseIntEnv("SERVICE_TTL", 15),
+		ServiceTTL:       parseDurationEnv("SERVICE_TTL", 15),
 		MaxServiceDigest: parseIntEnv("MAX_SERVICE_DIGEST", 64),
 
 		RegistryURL: mustEnv("REGISTRY_URL", "registry:8089"),
 
 		QuorumK:            parseIntEnv("QUORUM_K", 2),
 		VoteWindow:         parseDurationEnv("VOTE_WINDOW", 6*time.Second),
-		CertTTL:            parseDurationEnv("OBIT_TTL", 18*time.Second),
+		CertTTL:            parseDurationEnv("CERT_TTL", 18*time.Second),
 		MaxVoteDigest:      parseIntEnv("MAX_VOTE_DIGEST", 16),
 		MaxCertDigest:      parseIntEnv("MAX_CERT_DIGEST", 8),
-		CertPriorityRounds: parseIntEnv("OBIT_PRIORITY_ROUNDS", 3),
+		CertPriorityRounds: parseIntEnv("CERT_PRIORITY_ROUNDS", 3),
 		VotePriorityRounds: parseIntEnv("VOTE_PRIORITY_ROUNDS", 2),
 	}
 	return cfg, nil
