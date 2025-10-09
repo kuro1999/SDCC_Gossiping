@@ -70,7 +70,7 @@ func GetNodeConfig() (NodeConfig, error) {
 		APIPort:               apiPort,
 		Services:              mustEnv("SERVICES", ""),
 		CalcPort:              parseIntEnv("CALC_PORT", 18080),
-		ServiceTTL:            parseDurationEnv("SERVICE_TTL", 15),
+		ServiceTTL:            parseDurationEnv("SERVICE_TTL", 15*time.Second),
 		ServiceRefreshTimeout: parseDurationEnv("SERVICE_REFRESH_TIMEOUT", 5*time.Second),
 		MaxServiceDigest:      parseIntEnv("MAX_SERVICE_DIGEST", 64),
 

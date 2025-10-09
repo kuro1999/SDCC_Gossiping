@@ -11,7 +11,15 @@ sleep $PAUSE_SECS
 echo "[BOOTSTRAP] Inizio bootstrap della rete..."
 sleep $PAUSE_SECS
 
-# --- Sonda: servizi locali PRIMA della registrazione ---
+echo "[STEP] Chiamo SUM su node1..."
+URL="http://node1:18080/sum?a=5&b=5"
+echo "$(date -Iseconds) [CALL] ${URL}"
+RESP="$(curl -sS "${URL}" || true)"
+echo "$(date -Iseconds) [CALL][DONE] result=${RESP}"
+sleep $PAUSE_SECS
+
+
+# --- servizi locali PRIMA della registrazione ---
 echo "[STEP] Servizi locali su node1 (PRIMA della registrazione)..."
 URL_SL_PRIMA="http://node1:9000/services/local"
 echo "$(date -Iseconds) [GET] ${URL_SL_PRIMA}"
@@ -23,7 +31,7 @@ else
 fi
 sleep $PAUSE_SECS
 
-# --- Sonda: discover PRIMA della registrazione ---
+# --- discover PRIMA della registrazione ---
 echo "[STEP] Discover calc (PRIMA della registrazione)..."
 URL_DISC_PRIMA="http://node1:9000/discover?service=calc"
 echo "$(date -Iseconds) [GET] ${URL_DISC_PRIMA}"
@@ -72,15 +80,10 @@ fi
 sleep $PAUSE_SECS
 
 echo "[STEP] Chiamo SUM su node1..."
-ADDR="$(curl -sS "http://node1:9000/discover?service=calc" | jq -r '.[0].addr // empty' || true)"
-if [ -n "${ADDR}" ]; then
-  URL="http://${ADDR}/sum?a=5&b=5"
-  echo "$(date -Iseconds) [CALL] ${URL}"
-  RESP="$(curl -sS "${URL}" || true)"
-  echo "$(date -Iseconds) [CALL][DONE] result=${RESP}"
-else
-  echo "$(date -Iseconds) [DISCOVER][WARN] nessun indirizzo trovato"
-fi
+URL="http://node1:18080/sum?a=5&b=5"
+echo "$(date -Iseconds) [CALL] ${URL}"
+RESP="$(curl -sS "${URL}" || true)"
+echo "$(date -Iseconds) [CALL][DONE] result=${RESP}"
 sleep $PAUSE_SECS
 
 echo "[STEP] Chiamo SUB su node1..."
@@ -131,15 +134,10 @@ fi
 sleep $PAUSE_SECS
 
 echo "[STEP] Chiamo SUM su node1..."
-ADDR="$(curl -sS "http://node1:9000/discover?service=calc" | jq -r '.[0].addr // empty' || true)"
-if [ -n "${ADDR}" ]; then
-  URL="http://${ADDR}/sum?a=5&b=5"
-  echo "$(date -Iseconds) [CALL] ${URL}"
-  RESP="$(curl -sS "${URL}" || true)"
-  echo "$(date -Iseconds) [CALL][DONE] result=${RESP}"
-else
-  echo "$(date -Iseconds) [DISCOVER][WARN] nessun indirizzo trovato"
-fi
+URL="http://node1:18080/sum?a=5&b=5"
+echo "$(date -Iseconds) [CALL] ${URL}"
+RESP="$(curl -sS "${URL}" || true)"
+echo "$(date -Iseconds) [CALL][DONE] result=${RESP}"
 sleep $PAUSE_SECS
 
 echo "===== [FINE] Sequenza completata ====="

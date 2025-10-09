@@ -68,11 +68,12 @@ func (n *Node) registerLocalService(service, instanceID, addr string, ttl time.D
 			Tombstone:   false,
 			LastUpdated: now,          // solo per metriche/log
 			ExpiresAt:   now.Add(ttl), // vero deadline locale
+			TTLSeconds:  ttl,
 		}
 		n.services[key] = cur
 		n.lastSvcVer[key] = nextVer
 
-		log.Printf("[SVC] registered %s id=%s addr=%s ttl=%ds ver=%d",
+		log.Printf("[SVC] registered %s id=%s addr=%s ttl=%v ver=%d",
 			service, instanceID, addr, ttl, nextVer)
 		return
 	}
@@ -91,7 +92,7 @@ func (n *Node) registerLocalService(service, instanceID, addr string, ttl time.D
 
 	n.lastSvcVer[key] = nextVer
 
-	log.Printf("[SVC] refresh %s id=%s addr=%s ttl=%ds ver=%d",
+	log.Printf("[SVC] refresh %s id=%s addr=%s ttl=%v ver=%d",
 		service, instanceID, cur.Addr, cur.TTLSeconds, nextVer)
 }
 
@@ -142,7 +143,6 @@ func (n *Node) pruneExpiredServices() {
 	defer n.mu.Unlock()
 	for k, s := range n.services {
 		// normalizza TTL se mancante nel config
-		ttlDur := time.Duration(s.TTLSeconds) * time.Second
 		//Timeout scaduto e tombstone = false, marco il servizio come DOWN
 		if s.Up && !s.Tombstone && now.After(s.ExpiresAt) {
 			// solo il proprietario può aumentarne la versione
@@ -157,10 +157,12 @@ func (n *Node) pruneExpiredServices() {
 			s.Up = false
 			log.Printf("[SVC] timeout -> DOWN %s id=%s ver=%d", s.Service, s.InstanceID, s.Version)
 		}
-		//elimina dopo 2*TTL dall’ultimo update
-		if now.Sub(s.LastUpdated) > 2*ttlDur {
+		//elimina dopo 3*TTL dall’ultimo update
+		age := now.Sub(s.LastUpdated).Seconds()
+		ttl := s.TTLSeconds.Seconds()
+		if age > 3*ttl {
 			delete(n.services, k)
-			log.Printf("[SVC] GC %s/%s (last=%s)", s.Service, s.InstanceID, s.LastUpdated.Format(time.RFC3339))
+			log.Printf("[SVC] GC %s/%s (last=%f) (now%f)", s.Service, s.InstanceID, age, 3*ttl)
 		}
 	}
 }

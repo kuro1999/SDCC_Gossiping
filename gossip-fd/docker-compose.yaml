@@ -1,8 +1,7 @@
-version: "3.9"
-
 services:
   # --- Registry ---
   registry:
+    image: registry-image-sdcc
     build:
       context: ./registry
       dockerfile: Dockerfile
@@ -24,7 +23,6 @@ services:
       - SELF_ID=${NODE1_ID}
       - SELF_ADDR=${NODE1_ID}:${NODE1_PORT}
       - REGISTRY_URL=${REGISTRY_HOST}:${REGISTRY_PORT}
-      - SEEDS=${SEEDS}
       - GOSSIP_INTERVAL=${GOSSIP_INTERVAL}
       - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL}
       - SUSPECT_TIMEOUT=${SUSPECT_TIMEOUT}
@@ -58,7 +56,6 @@ services:
       - SELF_ID=${NODE2_ID}
       - SELF_ADDR=${NODE2_ID}:${NODE2_PORT}
       - REGISTRY_URL=${REGISTRY_HOST}:${REGISTRY_PORT}
-      - SEEDS=${SEEDS}
       - GOSSIP_INTERVAL=${GOSSIP_INTERVAL}
       - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL}
       - SUSPECT_TIMEOUT=${SUSPECT_TIMEOUT}
@@ -92,7 +89,6 @@ services:
       - SELF_ID=${NODE3_ID}
       - SELF_ADDR=${NODE3_ID}:${NODE3_PORT}
       - REGISTRY_URL=${REGISTRY_HOST}:${REGISTRY_PORT}
-      - SEEDS=${SEEDS}
       - GOSSIP_INTERVAL=${GOSSIP_INTERVAL}
       - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL}
       - SUSPECT_TIMEOUT=${SUSPECT_TIMEOUT}
@@ -126,7 +122,6 @@ services:
       - SELF_ID=${NODE4_ID}
       - SELF_ADDR=${NODE4_ID}:${NODE4_PORT}
       - REGISTRY_URL=${REGISTRY_HOST}:${REGISTRY_PORT}
-      - SEEDS=${SEEDS}
       - GOSSIP_INTERVAL=${GOSSIP_INTERVAL}
       - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL}
       - SUSPECT_TIMEOUT=${SUSPECT_TIMEOUT}
@@ -160,7 +155,6 @@ services:
       - SELF_ID=${NODE5_ID}
       - SELF_ADDR=${NODE5_ID}:${NODE5_PORT}
       - REGISTRY_URL=${REGISTRY_HOST}:${REGISTRY_PORT}
-      - SEEDS=${SEEDS}
       - GOSSIP_INTERVAL=${GOSSIP_INTERVAL}
       - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL}
       - SUSPECT_TIMEOUT=${SUSPECT_TIMEOUT}
@@ -194,7 +188,6 @@ services:
       - SELF_ID=${NODE6_ID}
       - SELF_ADDR=${NODE6_ID}:${NODE6_PORT}
       - REGISTRY_URL=${REGISTRY_HOST}:${REGISTRY_PORT}
-      - SEEDS=${SEEDS}
       - GOSSIP_INTERVAL=${GOSSIP_INTERVAL}
       - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL}
       - SUSPECT_TIMEOUT=${SUSPECT_TIMEOUT}
@@ -228,7 +221,6 @@ services:
       - SELF_ID=${NODE7_ID}
       - SELF_ADDR=${NODE7_ID}:${NODE7_PORT}
       - REGISTRY_URL=${REGISTRY_HOST}:${REGISTRY_PORT}
-      - SEEDS=${SEEDS}
       - GOSSIP_INTERVAL=${GOSSIP_INTERVAL}
       - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL}
       - SUSPECT_TIMEOUT=${SUSPECT_TIMEOUT}
@@ -253,15 +245,16 @@ services:
       - "${NODE7_CALC_PORT}:${NODE7_CALC_PORT}"
     restart: unless-stopped
 
-  orchestrator:
+  test_services:
+    image: test_services_image_sdcc
     build:
-      context: ./orchestrator
-    container_name: orchestrator
+      context: test_services
+    container_name: test_services
     depends_on:
       - node1
       - node2
       - node3
-    restart: unless-stopped
+    restart: no
 
 networks:
   default:

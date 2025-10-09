@@ -352,13 +352,13 @@ func (n *Node) startDiscoveryAPI(port int) {
 	//rispondo con i servizi attivi localmente sul nodo
 	mux.HandleFunc("/services/local", func(w http.ResponseWriter, r *http.Request) {
 		type out struct {
-			Service    string        `json:"service"`
-			InstanceID string        `json:"id"`
-			Addr       string        `json:"addr"`
-			Version    uint64        `json:"ver"`
-			TTL        time.Duration `json:"ttl"`
-			Up         bool          `json:"up"`
-			AgeSec     int64         `json:"age_sec"`
+			Service    string  `json:"service"`
+			InstanceID string  `json:"id"`
+			Addr       string  `json:"addr"`
+			Version    uint64  `json:"ver"`
+			TTL        float64 `json:"ttl"`
+			Up         bool    `json:"up"`
+			AgeSec     int64   `json:"age_sec"`
 		}
 		now := time.Now()
 		resp := []out{}
@@ -369,7 +369,7 @@ func (n *Node) startDiscoveryAPI(port int) {
 			}
 			resp = append(resp, out{
 				Service: s.Service, InstanceID: s.InstanceID, Addr: s.Addr,
-				Version: s.Version, TTL: s.TTLSeconds, Up: s.Up,
+				Version: s.Version, TTL: s.TTLSeconds.Seconds(), Up: s.Up,
 				AgeSec: int64(now.Sub(s.LastUpdated).Seconds()),
 			})
 		}
@@ -433,9 +433,8 @@ func (n *Node) startDiscoveryAPI(port int) {
 	})
 
 	srv := &http.Server{
-		Addr:              fmt.Sprintf(":%d", port),
-		Handler:           mux,
-		ReadHeaderTimeout: 3 * time.Second,
+		Addr:    fmt.Sprintf(":%d", port),
+		Handler: mux,
 	}
 	log.Printf("[HTTP] discovery API listening on :%d", port)
 	if err := srv.ListenAndServe(); err != nil {
@@ -449,11 +448,13 @@ func (n *Node) maybeStartDemoServices() {
 		s = strings.TrimSpace(s)
 		switch s {
 		case "calc":
-			go startCalcService(n, n.cfg.CalcPort, true) //fai partire il servizio
+			// Avvia il servizio e registralo
+			go startCalcService(n, n.cfg.CalcPort, true)
+			n.registerLocalService("calc", n.cfg.SelfID+"-calc", fmt.Sprintf("%s:%d", n.cfg.SelfAddr, n.cfg.CalcPort), n.cfg.ServiceTTL)
 		case "":
 			// no-op
 		default:
-			log.Printf("[WARN] service %q not recognized (demo only supports 'calc')", s)
+			log.Printf("[WARN] servizio %q non riconosciuto (demo supporta solo 'calc')", s)
 		}
 	}
 }
@@ -662,7 +663,7 @@ func (n *Node) printView() {
 				default:
 					status = "down"
 				}
-				log.Printf("      └─ svc=%-10s id=%-14s %-5s ver=%-3d ttl=%-2ds age=%-8s addr=%s",
+				log.Printf("      └─ svc=%-10s id=%-14s %-5s ver=%-3d ttl=%v age=%-8s addr=%s",
 					s.Service, s.InstanceID, status, s.Version, ttl, age, s.Addr)
 			}
 		}

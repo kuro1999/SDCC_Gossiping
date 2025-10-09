@@ -236,9 +236,8 @@ func (n *Node) buildReplyDiff(gm *GossipMessage) GossipMessage {
 		thisUp := s.Up && !s.Tombstone
 
 		if s.Version > lastKnownVer || thisUp != lastKnownUp {
-			ttl := s.TTLSeconds
-			if ttl <= 0 {
-				ttl = n.cfg.ServiceTTL
+			if s.TTLSeconds <= 0 {
+				s.TTLSeconds = n.cfg.ServiceTTL
 			}
 			sa = append(sa, ServiceAnnouncement{
 				Service:    s.Service,
@@ -246,7 +245,7 @@ func (n *Node) buildReplyDiff(gm *GossipMessage) GossipMessage {
 				NodeID:     s.NodeID,
 				Addr:       s.Addr,
 				Version:    s.Version,
-				TTLSeconds: ttl,
+				TTLSeconds: s.TTLSeconds,
 				Up:         thisUp,
 				Tombstone:  s.Tombstone,
 			})
