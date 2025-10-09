@@ -160,7 +160,7 @@ func (n *Node) pruneExpiredServices() {
 		//elimina dopo 3*TTL dall’ultimo update
 		age := now.Sub(s.LastUpdated).Seconds()
 		ttl := s.TTLSeconds.Seconds()
-		if age > 3*ttl {
+		if age > 2*ttl {
 			delete(n.services, k)
 			log.Printf("[SVC] GC %s/%s (last=%f) (now%f)", s.Service, s.InstanceID, age, 3*ttl)
 		}

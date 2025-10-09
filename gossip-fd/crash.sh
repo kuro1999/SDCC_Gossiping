@@ -17,5 +17,4 @@ echo"stopping simulation"
 # Ferma e rimuove container, immagini e volumi
 docker-compose down --rmi all --volumes --remove-orphans
 
-# --- Se vuoi vedere i log in un altro terminale, usa il comando qui sotto ---
 # docker-compose logs -f
