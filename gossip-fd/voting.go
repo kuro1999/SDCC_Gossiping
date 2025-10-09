@@ -99,7 +99,7 @@ func (n *Node) ingestCertificates(certs []DeathCertificate) (evicted int) {
 		// se ho ALIVE più recenti dell'evidenza del certificato, ignoro
 		if m, ok := n.members[o.Target]; ok && m.State == StateAlive {
 			local := DeathEvidence{Inc: m.Incarnation, Hb: m.Heartbeat}
-			log.Printf("[CERT-IGNORE] target=%s ignorato (local ALIVE inc=%d hb=%d > cert inc=%d hb=%d)",
+			log.Printf("[CERT-IGNORE] target=%s ignored (local ALIVE inc=%d hb=%d > cert inc=%d hb=%d)",
 				o.Target, m.Incarnation, m.Heartbeat, o.Inc, o.Hb)
 			if evidenceNewer(local, DeathEvidence{Inc: o.Inc, Hb: o.Hb}) {
 				continue
@@ -155,7 +155,7 @@ func (n *Node) ingestVotes(votes []DeathVote) (promoted int) {
 				ExpiresAt: now.Add(n.cfg.VoteWindow),
 				Priority:  n.cfg.VotePriorityRounds,
 			}
-			log.Printf("[VOTE] creato bucket per %s (inc=%d hb=%d, Δ=%s)", v.Target, v.Inc, v.Hb, n.cfg.VoteWindow)
+			log.Printf("[VOTE] created bucket fot+r %s (inc=%d hb=%d, Δ=%s)", v.Target, v.Inc, v.Hb, n.cfg.VoteWindow)
 			n.votes[v.Target] = b
 		}
 		// mantieni evidenza più recente
@@ -174,7 +174,7 @@ func (n *Node) ingestVotes(votes []DeathVote) (promoted int) {
 
 		// quorum raggiunto?
 		if len(b.Witness) >= quorum {
-			log.Printf("[EMISSION] quorum raggiunto per %s (K=%d, inc=%d hb=%d) → certificato emesso (TTL=%s)",
+			log.Printf("[EMISSION] quorum reached for %s (K=%d, inc=%d hb=%d) → certificate emitted (TTL=%s)",
 				v.Target, quorum, b.Evidence.Inc, b.Evidence.Hb, n.cfg.CertTTL)
 			// promuovi a certificato di mort
 			if _, exists := n.DeathCertificates[v.Target]; !exists {
@@ -312,7 +312,7 @@ func (n *Node) evictMemberLocked(id string) {
 			}
 		}
 		n.recentlyEvicted[id] = now
-		log.Printf("[EVICT] rimosso %s per certificato", id)
+		log.Printf("[EVICT] removed %s cause Death certificate", id)
 	}
 }
 

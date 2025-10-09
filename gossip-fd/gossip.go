@@ -118,16 +118,16 @@ func (n *Node) suspicionLoop() {
 			log.Printf("[STATE] %s -> %s (peer=%s, lastSeen=%s, Δ=%s)",
 				x.old, x.new, x.id, x.lastSeen.Format(time.RFC3339), x.delta.Truncate(time.Millisecond))
 			if x.new == StateDead {
-				log.Printf("[EVENTO] Nodo %s è diventato DEAD. Emesso voto locale.", x.id)
+				log.Printf("[EVENTO] Node %s is DEAD. Emitted local vote.", x.id)
 			}
 		}
 		//emessione dei voti locali
 		for _, d := range localDead {
 			n.recordLocalVote(d.id, DeathEvidence{Inc: d.inc, Hb: d.hb})
-			log.Printf("[VOTE] emesso voto locale per %s (inc=%d hb=%d)", d.id, d.inc, d.hb)
+			log.Printf("[VOTE] emitted local vote for %s (inc=%d hb=%d)", d.id, d.inc, d.hb)
 		}
 		if len(localDead) > 0 {
-			log.Printf("[VOTE] emessi %d voti locali (Δ=%s, K=%d)", len(localDead), n.cfg.VoteWindow, n.cfg.QuorumK)
+			log.Printf("[VOTE] emitted %d local votes (Δ=%s, K=%d)", len(localDead), n.cfg.VoteWindow, n.cfg.QuorumK)
 		}
 		// elimina servizi scaduti
 		n.pruneExpiredServices()
@@ -140,7 +140,6 @@ func (n *Node) sendGossip() {
 	//Scelta target
 	targets := n.pickRandomTargets(fanoutK)
 	if len(targets) == 0 {
-		log.Printf("[STATE] no targets picked")
 		return
 	}
 	//costruisco il  messaggio
@@ -286,7 +285,7 @@ func (n *Node) buildReplyDiff(gm *GossipMessage) GossipMessage {
 func (n *Node) buildMessage(isReply bool) GossipMessage {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	// --- membership digest ---
+	// membership digest
 	sums := make([]MemberSummary, 0, len(n.members))
 	for _, m := range n.members {
 		sums = append(sums, MemberSummary{
@@ -315,7 +314,7 @@ func (n *Node) buildMessage(isReply bool) GossipMessage {
 		sums = sums[:n.cfg.MaxDigestPeers]
 	}
 
-	// --- service digest ---
+	// service digest
 	sann := make([]ServiceAnnouncement, 0, len(n.services))
 	for _, s := range n.services {
 		sann = append(sann, ServiceAnnouncement{
@@ -329,7 +328,7 @@ func (n *Node) buildMessage(isReply bool) GossipMessage {
 			Tombstone:  s.Tombstone,
 		})
 	}
-	//riordino in base all importanza degli aggiornamenti
+	//riordino in base all importanz degli aggiornamenti
 	sort.Slice(sann, func(i, j int) bool {
 		if sann[i].Up != sann[j].Up {
 			return sann[i].Up && !sann[j].Up
@@ -345,7 +344,7 @@ func (n *Node) buildMessage(isReply bool) GossipMessage {
 	if len(sann) > n.cfg.MaxServiceDigest {
 		sann = sann[:n.cfg.MaxServiceDigest]
 	}
-	// ====== piggyback certs e votes ======
+	// certificati e voti
 	certs := n.selectCertsLocked(n.cfg.MaxCertDigest)
 	votes := n.selectVotesLocked(n.cfg.MaxVoteDigest)
 
@@ -365,7 +364,7 @@ func (n *Node) mergeMembership(gm *GossipMessage) int {
 	updated := 0
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	// --- SELF-BUMP: se i peer mi riportano con una inc >= della mia, salto avanti (non sapevo di essere morto)---
+	// SELF-BUMP: se i peer mi riportano con una inc >= della mia, salto avanti
 	self := n.members[n.cfg.SelfID]
 	for _, s := range gm.Membership {
 		if s.ID != n.cfg.SelfID {
@@ -395,7 +394,7 @@ func (n *Node) mergeMembership(gm *GossipMessage) int {
 			updated++
 		}
 	}
-	// --- merge degli altri membri (inc, hb) ---
+	// merge degli altri membri (inc, hb)
 	for _, s := range gm.Membership {
 		if s.ID == n.cfg.SelfID {
 			continue
@@ -405,7 +404,7 @@ func (n *Node) mergeMembership(gm *GossipMessage) int {
 			m = &Member{ID: s.ID, Addr: s.Addr}
 			n.members[s.ID] = m
 			updated++
-			log.Printf("[MERGE] Nuovo membro aggiunto: %s", s.ID)
+			log.Printf("[MERGE] New member added: %s", s.ID)
 		}
 		if s.Addr != "" && s.Addr != m.Addr {
 			m.Addr = s.Addr

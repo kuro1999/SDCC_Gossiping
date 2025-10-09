@@ -19,11 +19,12 @@ type NodeConfig struct {
 	FanoutK           int
 
 	// Service discovery
-	APIPort          int
-	Services         string
-	CalcPort         int
-	ServiceTTL       time.Duration
-	MaxServiceDigest int
+	APIPort               int
+	Services              string
+	CalcPort              int
+	ServiceTTL            time.Duration
+	ServiceRefreshTimeout time.Duration
+	MaxServiceDigest      int
 
 	// Registry
 	RegistryURL string
@@ -42,15 +43,15 @@ func GetNodeConfig() (NodeConfig, error) {
 	id := mustEnv("SELF_ID", "")
 	addr := mustEnv("SELF_ADDR", "") // "node1:9000"
 	if id == "" || addr == "" {
-		return NodeConfig{}, fmt.Errorf("SELF_ID e SELF_ADDR sono obbligatori")
+		return NodeConfig{}, fmt.Errorf("SELF_ID e SELF_ADDR are mandatory")
 	}
 	_, portStr, ok := strings.Cut(addr, ":")
 	if !ok || portStr == "" {
-		return NodeConfig{}, fmt.Errorf("SELF_ADDR senza porta: %s", addr)
+		return NodeConfig{}, fmt.Errorf("SELF_ADDR without port: %s", addr)
 	}
 	udpPort, err := strconv.Atoi(portStr)
 	if err != nil {
-		return NodeConfig{}, fmt.Errorf("porta invalida in SELF_ADDR: %v", err)
+		return NodeConfig{}, fmt.Errorf("invalid port in SELF_ADDR: %v", err)
 	}
 
 	apiPort := parseIntEnv("API_PORT", udpPort)
@@ -66,11 +67,12 @@ func GetNodeConfig() (NodeConfig, error) {
 		MaxDigestPeers:    parseIntEnv("MAX_DIGEST_PEERS", 64),
 		FanoutK:           parseIntEnv("FANOUT_K", 0),
 
-		APIPort:          apiPort,
-		Services:         mustEnv("SERVICES", ""),
-		CalcPort:         parseIntEnv("CALC_PORT", 18080),
-		ServiceTTL:       parseDurationEnv("SERVICE_TTL", 15),
-		MaxServiceDigest: parseIntEnv("MAX_SERVICE_DIGEST", 64),
+		APIPort:               apiPort,
+		Services:              mustEnv("SERVICES", ""),
+		CalcPort:              parseIntEnv("CALC_PORT", 18080),
+		ServiceTTL:            parseDurationEnv("SERVICE_TTL", 15),
+		ServiceRefreshTimeout: parseDurationEnv("SERVICE_REFRESH_TIMEOUT", 5*time.Second),
+		MaxServiceDigest:      parseIntEnv("MAX_SERVICE_DIGEST", 64),
 
 		RegistryURL: mustEnv("REGISTRY_URL", "registry:8089"),
 

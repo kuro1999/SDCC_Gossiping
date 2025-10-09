@@ -72,7 +72,7 @@ func (n *Node) registerLocalService(service, instanceID, addr string, ttl time.D
 		n.services[key] = cur
 		n.lastSvcVer[key] = nextVer
 
-		log.Printf("[SVC] registrato %s id=%s addr=%s ttl=%ds ver=%d",
+		log.Printf("[SVC] registered %s id=%s addr=%s ttl=%ds ver=%d",
 			service, instanceID, addr, ttl, nextVer)
 		return
 	}
@@ -133,7 +133,7 @@ func (n *Node) deregisterLocalService(service, instanceID string) {
 		cur.ExpiresAt = now
 	}
 	n.lastSvcVer[key] = nextVer
-	log.Printf("[SVC] deregistrato %s id=%s ver=%d", service, instanceID, nextVer)
+	log.Printf("[SVC] deregistered %s id=%s ver=%d", service, instanceID, nextVer)
 }
 
 func (n *Node) pruneExpiredServices() {
@@ -166,7 +166,7 @@ func (n *Node) pruneExpiredServices() {
 }
 
 func (n *Node) serviceRefreshLoop() {
-	t := time.NewTicker(5 * time.Second)
+	t := time.NewTicker(n.cfg.ServiceRefreshTimeout)
 	defer t.Stop()
 	for range t.C {
 		// refresha solo le istanze locali (NodeID == SelfID)

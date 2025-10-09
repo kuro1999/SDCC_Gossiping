@@ -113,9 +113,9 @@ func (n *Node) run() {
 	// recupero lista peer dal registry
 	if peers, err := n.bootstrapFromRegistry(); err != nil {
 
-		log.Printf("[ERROR] Errore nel bootstrap dal registry: %v", err)
+		log.Printf("[ERROR] Error during bootstrap from registry: %v", err)
 	} else {
-		log.Printf("[END-BOOT] peers received: %v", peers)
+		log.Printf("[END-BOOT] peers receiced: %v", peers)
 		for _, p := range peers {
 			// p è un addr HTTP "host:porta" restituito dal registry
 			host, _, _ := strings.Cut(p, ":")
@@ -135,7 +135,6 @@ func (n *Node) run() {
 				}
 			} else { //se assente nella membership
 				// nuovo peer in vista iniziale
-				log.Printf("[MACCHECCAZZONESOIO] node:port %s", p)
 				n.members[host] = &Member{
 					ID:        host, // ID canonico = solo host
 					Addr:      p,    // indirizzo completo host:porta per UDP/HTTP
@@ -159,7 +158,6 @@ func (n *Node) run() {
 	n.maybeStartDemoServices()
 
 	go n.serviceRefreshLoop()
-	log.Printf("[BOOT] AVVIATE TUTTE LE ROUTINE")
 	//Stampa periodicamente la view della membership
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
@@ -222,7 +220,6 @@ func (n *Node) receiveLoop() {
 			log.Printf("[RECV-ERR] %v", err)
 			continue
 		}
-		log.Printf("MAAAAAAAAA IO STO A RICEVE QUALCOSAAAAAAAAAAAAA!!!!!!!!! BOH")
 		data := make([]byte, nRead)
 		copy(data, buf[:nRead])
 
@@ -257,7 +254,7 @@ func (n *Node) receiveLoop() {
 			gm.Membership = dst
 		}()
 		if filtered > 0 {
-			//log.Printf("[DEATH] filtrate %d entry membership coperte da certificati attivi (da %s)", filtered, gm.FromID)
+			log.Printf("[DEATH] filtrate %d entry membership coperte da certificati attivi (da %s)", filtered, gm.FromID)
 		}
 		// Merge membership e merge dei servizi
 		mu := n.mergeMembership(&gm)
@@ -286,7 +283,7 @@ func (n *Node) receiveLoop() {
 			}
 		}
 		if mu+su == 0 {
-			log.Printf("[MERGE] da=%s, membri=%d, servizi=%d non effettuata", gm.FromID, mu, su)
+			log.Printf("[MERGE] from=%s, members=%d, services=%d non processed", gm.FromID, mu, su)
 		}
 	}
 }
@@ -319,7 +316,7 @@ func (n *Node) startDiscoveryAPI(port int) {
 		if req.Service == "calc" && !n.calcStarted {
 			n.calcStarted = true
 			go startCalcService(n, n.cfg.CalcPort, false) // false: niente auto-register
-			log.Printf("[SVC] avviato calc su :%d in seguito a /service/register", port)
+			log.Printf("[SVC] registring calc on :%d cause /service/register", port)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
@@ -385,7 +382,7 @@ func (n *Node) startDiscoveryAPI(port int) {
 	mux.HandleFunc("/discover", func(w http.ResponseWriter, r *http.Request) {
 		svc := r.URL.Query().Get("service")
 		if strings.TrimSpace(svc) == "" {
-			http.Error(w, "parametro 'service' mancante", http.StatusBadRequest)
+			http.Error(w, "parameter 'service' massing", http.StatusBadRequest)
 			return
 		}
 
@@ -440,9 +437,9 @@ func (n *Node) startDiscoveryAPI(port int) {
 		Handler:           mux,
 		ReadHeaderTimeout: 3 * time.Second,
 	}
-	log.Printf("[HTTP] discovery API in ascolto su :%d", port)
+	log.Printf("[HTTP] discovery API listening on :%d", port)
 	if err := srv.ListenAndServe(); err != nil {
-		log.Fatalf("[HTTP] API errore: %v", err)
+		log.Fatalf("[HTTP] API error: %v", err)
 	}
 }
 
@@ -456,7 +453,7 @@ func (n *Node) maybeStartDemoServices() {
 		case "":
 			// no-op
 		default:
-			log.Printf("[WARN] servizio %q non riconosciuto (demo supporta solo 'calc')", s)
+			log.Printf("[WARN] service %q not recognized (demo only supports 'calc')", s)
 		}
 	}
 }
@@ -518,9 +515,9 @@ func startCalcService(n *Node, port int, autoRegister bool) {
 		Handler: mux,
 		//ReadHeaderTimeout: 3 * time.Second,
 	}
-	log.Printf("[HTTP] calc service su :%d (%s)", port, addr)
+	log.Printf("[HTTP] calc service on :%d (%s)", port, addr)
 	if err := srv.ListenAndServe(); err != nil {
-		log.Fatalf("[HTTP] calc errore: %v", err)
+		log.Fatalf("[HTTP] calc error: %v", err)
 		return
 	}
 }
@@ -529,15 +526,15 @@ func readAB(r *http.Request) (int, int, error) {
 	aStr := r.URL.Query().Get("a")
 	bStr := r.URL.Query().Get("b")
 	if aStr == "" || bStr == "" {
-		return 0, 0, fmt.Errorf("parametri 'a' e 'b' richiesti")
+		return 0, 0, fmt.Errorf("parameter 'a' and 'b' required")
 	}
 	a, err := strconv.Atoi(aStr)
 	if err != nil {
-		return 0, 0, fmt.Errorf("a non è un intero")
+		return 0, 0, fmt.Errorf("a is not an integer")
 	}
 	b, err := strconv.Atoi(bStr)
 	if err != nil {
-		return 0, 0, fmt.Errorf("b non è un intero")
+		return 0, 0, fmt.Errorf("b is not an integer")
 	}
 	return a, b, nil
 }
@@ -573,7 +570,6 @@ func (n *Node) pickRandomTargets(k int) []*Member {
 	defer n.mu.Unlock()
 	// Crea una lista di nodi ALIVE e SUSPECT
 	peers := make([]*Member, 0, len(n.members))
-	log.Printf("[MEMBERSHIP] attuale membership prima di capire a chi mandare %v", n.members)
 	for id, m := range n.members {
 		if id == n.cfg.SelfID {
 			continue
@@ -584,17 +580,14 @@ func (n *Node) pickRandomTargets(k int) []*Member {
 	}
 	// Se non ci sono peer disponibili, ritorna nil
 	if len(peers) == 0 {
-		log.Printf("[COSTRUENDO PEERS]: no targets picked")
 		return nil
 	}
 	// Se il numero di peer è inferiore al fanoutK, ritorna tutti i peer
 	if len(peers) <= k {
-		log.Printf("[COSTRUENDO PEERS]: target picked %v", peers)
 		return peers
 	}
 	// Ritorna solo i primi 'k' peer
 	rand.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
-	log.Printf("[COSTRUENDO PEERS]: target picked %v", peers)
 	return peers[:k]
 }
 
@@ -680,7 +673,7 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	node, err := NewNode()
 	if err != nil {
-		log.Fatalf("Errore configurazione: %v", err)
+		log.Fatalf("Configuration error: %v", err)
 	}
 	node.run()
 	select {}
